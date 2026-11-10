@@ -28,6 +28,7 @@ static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
 std::atomic<u32> g_lbp3ImageCreates{};
 std::atomic<u32> g_lbp3ImageExpands{};
+std::atomic<u32> g_lbp3ImageReadbacks{};  // images written back for the CPU (status line)
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -76,6 +77,9 @@ TextureCache::~TextureCache() = default;
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
     for (const ImageId image_id : download_images) {
+        if (True(slot_images[image_id].flags & ImageFlagBits::GpuModified)) {
+            ++g_lbp3ImageReadbacks;
+        }
         DownloadImageMemory(image_id, true);
     }
     download_images.clear();
@@ -679,10 +683,25 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     return image.FindView(desc.view_info);
 }
 
+// LBP3: render targets the game reads back on the CPU. Its captures (Take A Photo, Capture
+// Object, the save icon, level thumbnails) render the scene into linear 32-bit colour targets
+// (1280x720, 640x360 and 320x180 at a 720p render size), and the game copies them out with a
+// plain memcpy a few frames later (eboot 0x4014f0), with no fence or label in between. Unless
+// the image is written back to guest memory, that copy reads zeros and the photo is black.
+// Such targets are downloaded (synchronously, at the submit or fence after the draw) even
+// without LBP3_READBACK_IMAGES. The game's other linear targets are 64-wide R8 ones drawn every
+// frame and a 3D storage volume, which stay on the GPU; LBP3_READBACK_IMAGES downloads those too.
+static bool IsCpuReadRenderTarget(const ImageInfo& info) {
+    return !info.props.is_tiled && !info.props.is_depth && info.num_bits == 32 &&
+           info.num_samples == 1 && info.size.depth == 1 && info.resources.layers == 1 &&
+           info.guest_address != 0;
+}
+
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    if ((readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) ||
+        IsCpuReadRenderTarget(image.info)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
