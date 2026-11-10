@@ -86,6 +86,9 @@ inline bool ShouldSkip(u64 h0, u64 h1 = 0) {
     return false;
 }
 
+// Run just before a lost device ends the process (the runtime writes its in-memory traces).
+inline void (*g_beforeExit)() = nullptr;
+
 inline bool Requested() {
     static const bool requested = std::getenv("LBP3_GPU_CHECKPOINTS") != nullptr;
     return requested;
@@ -184,6 +187,7 @@ inline void PrintCheckpoints(vk::Queue queue) {
                  "(Windows TDR). Last marker recorded: #%llu\n",
                  where, (unsigned long long)tick, (unsigned long long)g_seq.load());
     PrintCheckpoints(queue);
+    if (g_beforeExit) g_beforeExit();
     std::fflush(stderr);
     std::_Exit(3);
 }
