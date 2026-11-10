@@ -1154,7 +1154,10 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         break;
     }
 
-    color.float32 = comp_swizzle.Apply(color.float32);
+    // The clear word is already in the colour buffer's channel order (the order its comp_swap
+    // gives), so it is not swizzled again: LBP3's Create sky (comp_swap Alternate) came out with
+    // red and blue swapped.
+    (void)comp_swizzle;
     return {.color = color};
 }
 
