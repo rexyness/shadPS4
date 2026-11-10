@@ -189,6 +189,14 @@ std::atomic<bool> g_lbp3TraceDraws{false};
 u32 g_lbp3TraceIndex = 0;
 void (*g_lbp3AfterDraw)(u32 index) = nullptr;
 
+// LBP3 Recompiled: LBP3_SKIP_SHADERS drops draws using a listed vertex or pixel shader.
+static bool Lbp3SkipDraw(const GraphicsPipeline* pipeline) {
+    const auto stages = pipeline->GetStages();
+    const auto* vs = stages[u32(Shader::SwStage::Vertex)];
+    const auto* ps = stages[u32(Shader::SwStage::Fragment)];
+    return Lbp3Checkpoints::ShouldSkip(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0);
+}
+
 // LBP3 Recompiled: a GPU checkpoint before a draw, with its vertex and pixel shader hashes.
 static void Lbp3Mark(vk::CommandBuffer cmdbuf, u64 tick, const GraphicsPipeline* pipeline,
                      Lbp3Checkpoints::Kind kind, u32 a, u32 b, u32 c = 0) {
@@ -260,6 +268,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    if (Lbp3SkipDraw(pipeline)) {
+        return;
+    }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -325,6 +336,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
+        return;
+    }
+    if (Lbp3SkipDraw(pipeline)) {
         return;
     }
 
@@ -403,6 +417,9 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (Lbp3Checkpoints::ShouldSkip(cs.pgm_hash)) {
+        return;
+    }
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
@@ -473,6 +490,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    if (Lbp3Checkpoints::ShouldSkip(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash)) {
+        return;
+    }
     if (!BindResources(pipeline)) {
         return;
     }
@@ -1278,6 +1298,8 @@ void Rasterizer::Resolve() {
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  liverpool->regs.color_buffers[0].Address(),
                                  liverpool->regs.color_buffers[1].Address()));
+    Lbp3Checkpoints::Mark(scheduler.CommandBuffer(), Lbp3Checkpoints::Kind::Resolve, scheduler.CurrentTick(),
+                          liverpool->regs.color_buffers[0].Address(), liverpool->regs.color_buffers[1].Address());
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();
@@ -1308,6 +1330,9 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
 
+    Lbp3Checkpoints::Mark(scheduler.CommandBuffer(), Lbp3Checkpoints::Kind::DepthStencilCopy,
+                          scheduler.CurrentTick(), regs.depth_buffer.DepthAddress(),
+                          regs.depth_buffer.DepthWriteAddress());
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
 
     ScopeMarkerEnd();
@@ -1330,6 +1355,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         }
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
+    Lbp3Checkpoints::Mark(scheduler.CommandBuffer(), Lbp3Checkpoints::Kind::FillBuffer, scheduler.CurrentTick(),
+                          address, 0, num_bytes, value, is_gds);
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
@@ -1361,6 +1388,8 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .dstOffset = dst_offset,
         .size = num_bytes,
     };
+    Lbp3Checkpoints::Mark(scheduler.CommandBuffer(), Lbp3Checkpoints::Kind::CopyBuffer, scheduler.CurrentTick(),
+                          dst, src, num_bytes, dst_gds, src_gds);
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
 }
 

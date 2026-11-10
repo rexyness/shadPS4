@@ -23,7 +23,10 @@
 
 namespace Vulkan::Lbp3Checkpoints {
 
-enum class Kind : u32 { Draw, DrawIndexed, DrawIndirect, Dispatch, DispatchIndirect, Readback, SubmitEnd };
+enum class Kind : u32 {
+    Draw, DrawIndexed, DrawIndirect, Dispatch, DispatchIndirect, Readback, SubmitEnd,
+    CopyBuffer, FillBuffer, Resolve, DepthStencilCopy
+};
 
 inline const char* KindName(Kind k) {
     switch (k) {
@@ -34,6 +37,10 @@ inline const char* KindName(Kind k) {
     case Kind::DispatchIndirect: return "dispatch-indirect";
     case Kind::Readback: return "display-readback";
     case Kind::SubmitEnd: return "submit-end";
+    case Kind::CopyBuffer: return "copy-buffer";
+    case Kind::FillBuffer: return "fill-buffer";
+    case Kind::Resolve: return "resolve";
+    case Kind::DepthStencilCopy: return "depth-stencil-copy";
     }
     return "?";
 }
@@ -50,6 +57,34 @@ inline constexpr size_t kRing = size_t{1} << 16;
 inline std::array<Record, kRing> g_ring{};
 inline std::atomic<u64> g_seq{0};
 inline bool g_on = false;  // set when the device is created with the extension
+
+// LBP3_SKIP_SHADERS=<hex>,<hex>...: drop every draw or dispatch that uses one of these
+// shader program hashes (a stopgap test: does the hang go away without that work?).
+inline bool ShouldSkip(u64 h0, u64 h1 = 0) {
+    static const std::vector<u64> skip = [] {
+        std::vector<u64> v;
+        if (const char* s = std::getenv("LBP3_SKIP_SHADERS")) {
+            for (const char* p = s; *p;) {
+                char* end = nullptr;
+                const u64 h = std::strtoull(p, &end, 16);
+                if (end == p) break;
+                v.push_back(h);
+                p = *end == ',' ? end + 1 : end;
+            }
+            std::fprintf(stderr, "[gpu] skipping work with %zu shader hash(es)\n", v.size());
+        }
+        return v;
+    }();
+    if (skip.empty()) return false;
+    for (const u64 h : skip) {
+        if ((h0 && h == h0) || (h1 && h == h1)) {
+            static std::atomic<u32> n{0};
+            if (n++ < 20) std::fprintf(stderr, "[gpu] skipped work with shader %016llx\n", (unsigned long long)h);
+            return true;
+        }
+    }
+    return false;
+}
 
 inline bool Requested() {
     static const bool requested = std::getenv("LBP3_GPU_CHECKPOINTS") != nullptr;
