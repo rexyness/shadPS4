@@ -1474,6 +1474,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     std::scoped_lock lk{submit_mutex};
+    if (gfx_blocked_on_wait > 0) ++submits_while_gfx_blocked;
     ++num_gfx_submits;
     ++num_submits;
     submit_cv.notify_one();

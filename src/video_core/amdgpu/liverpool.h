@@ -153,6 +153,10 @@ public:
         }
     }
 
+    u32 TakeSubmitsWhileGfxBlocked() noexcept {
+        return submits_while_gfx_blocked.exchange(0);
+    }
+
     bool IsGpuIdle() const {
         return num_submits == 0;
     }
@@ -306,6 +310,7 @@ private:
     std::atomic<bool> submit_done{};
     std::atomic<u32> queues_blocked_on_wait{};
     std::atomic<u32> num_gfx_submits{};        // graphics submissions not finished yet
+    std::atomic<u32> submits_while_gfx_blocked{};  // ticket 10's residual window
     std::atomic<u32> gfx_blocked_on_wait{};    // the graphics queue is blocked on a wait
     std::atomic<u64> gfx_last_blocked_addr{};
     std::atomic<u64> last_blocked_addr{};      // memory address of the latest blocked wait (0: register)
