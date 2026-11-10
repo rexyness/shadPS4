@@ -10,6 +10,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/renderer_vulkan/lbp3_checkpoints.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -188,6 +189,21 @@ std::atomic<bool> g_lbp3TraceDraws{false};
 u32 g_lbp3TraceIndex = 0;
 void (*g_lbp3AfterDraw)(u32 index) = nullptr;
 
+// LBP3 Recompiled: a GPU checkpoint before a draw, with its vertex and pixel shader hashes.
+static void Lbp3Mark(vk::CommandBuffer cmdbuf, u64 tick, const GraphicsPipeline* pipeline,
+                     Lbp3Checkpoints::Kind kind, u32 a, u32 b, u32 c = 0) {
+    if (!Lbp3Checkpoints::g_on) {
+        return;
+    }
+    const auto stages = pipeline->GetStages();
+    const auto hash = [&](Shader::SwStage st) -> u64 {
+        const auto* info = stages[u32(st)];
+        return info ? info->pgm_hash : 0;
+    };
+    Lbp3Checkpoints::Mark(cmdbuf, kind, tick, hash(Shader::SwStage::Vertex),
+                          hash(Shader::SwStage::Fragment), a, b, c);
+}
+
 void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
     ++g_lbp3TraceIndex;
@@ -273,6 +289,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    Lbp3Mark(cmdbuf, scheduler.CurrentTick(), pipeline,
+             is_indexed ? Lbp3Checkpoints::Kind::DrawIndexed : Lbp3Checkpoints::Kind::Draw,
+             regs.num_indices, regs.num_instances.NumInstances());
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -344,6 +363,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    Lbp3Mark(cmdbuf, scheduler.CurrentTick(), pipeline, Lbp3Checkpoints::Kind::DrawIndirect, max_count, stride,
+             count_address != 0);
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -433,6 +454,8 @@ void Rasterizer::DispatchDirect() {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    Lbp3Checkpoints::Mark(cmdbuf, Lbp3Checkpoints::Kind::Dispatch, scheduler.CurrentTick(),
+                          cs.pgm_hash, 0, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
 
@@ -467,6 +490,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    if (Lbp3Checkpoints::g_on) {  // the group counts as the CPU last saw them
+        const auto* dims = reinterpret_cast<const u32*>(address + offset);
+        Lbp3Checkpoints::Mark(cmdbuf, Lbp3Checkpoints::Kind::DispatchIndirect, scheduler.CurrentTick(),
+                              pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, address + offset,
+                              dims[0], dims[1], dims[2]);
+    }
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
 

@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/lbp3_checkpoints.h"
 
 #include <vk_mem_alloc.h>
 
@@ -229,7 +230,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -244,6 +245,12 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "Extension {} unavailable.", extension);
         return false;
     };
+
+    // LBP3 Recompiled: GPU checkpoints to name the work behind a driver reset.
+    if (Lbp3Checkpoints::Requested()) {
+        Lbp3Checkpoints::g_on = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        std::fprintf(stderr, "[gpu] checkpoints %s\n", Lbp3Checkpoints::g_on ? "on" : "unsupported");
+    }
 
     // Required
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),

@@ -4,6 +4,7 @@
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/lbp3_checkpoints.h"
 
 #include "common/assert.h"
 
@@ -62,7 +63,13 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    vk::Result result;
+    while ((result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT)) !=
+           vk::Result::eSuccess) {
+        // LBP3 Recompiled: a lost device never signals; report it instead of spinning forever.
+        if (result == vk::Result::eErrorDeviceLost) {
+            Lbp3Checkpoints::OnDeviceLost(instance.GetGraphicsQueue(), "Semaphore::Wait", tick);
+        }
     }
     Refresh();
 }

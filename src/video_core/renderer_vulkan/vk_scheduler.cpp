@@ -7,6 +7,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/lbp3_checkpoints.h"
 
 namespace Vulkan {
 
@@ -198,6 +199,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         on_submit(info);
     }
 
+    if (!sessions.empty()) {
+        Lbp3Checkpoints::Mark(CommandBuffer(), Lbp3Checkpoints::Kind::SubmitEnd, signal_value);
+    }
     EndSession();
 
     std::vector<vk::CommandBuffer> cmd_buffers;
@@ -238,7 +242,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        Lbp3Checkpoints::OnDeviceLost(instance.GetGraphicsQueue(), "SubmitExecution", signal_value);
+    }
 
     work_semaphore.Refresh();
     BeginSession();
