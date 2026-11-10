@@ -109,6 +109,30 @@ inline void PrintCheckpoints(vk::Queue queue) {
     for (u64 s = from; s <= to && s <= g_seq.load() && s - from < 400; ++s) {
         PrintRecord(s, s < bottom ? "done     " : s <= top ? "IN FLIGHT" : "not begun");
     }
+    // The whole submission the hung work belongs to, one line per distinct piece of work.
+    const u64 last = g_seq.load();
+    if (top && g_ring[top % kRing].seq == top) {
+        const u64 tick = g_ring[top % kRing].tick;
+        struct Group { Kind kind; u64 h0, h1; u32 count; u64 first, lastSeq; };
+        std::vector<Group> groups;
+        for (u64 s = last > kRing ? last - kRing + 1 : 1; s <= last; ++s) {
+            const Record& r = g_ring[s % kRing];
+            if (r.seq != s || r.tick != tick) continue;
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {
+                return g.kind == r.kind && g.h0 == r.h0 && g.h1 == r.h1;
+            });
+            if (it == groups.end()) groups.push_back({r.kind, r.h0, r.h1, 1, s, s});
+            else { ++it->count; it->lastSeq = s; }
+        }
+        std::fprintf(stderr, "[gpu] submission tick %llu: %zu distinct pieces of work\n", (unsigned long long)tick,
+                     groups.size());
+        for (const auto& g : groups) {
+            std::fprintf(stderr, "[gpu]   %-17s h0=%016llx h1=%016llx x%u  #%llu..#%llu%s\n", KindName(g.kind),
+                         (unsigned long long)g.h0, (unsigned long long)g.h1, g.count,
+                         (unsigned long long)g.first, (unsigned long long)g.lastSeq,
+                         g.first <= top && top <= g.lastSeq ? "  <- top of pipe" : "");
+        }
+    }
     std::fflush(stderr);
 }
 
