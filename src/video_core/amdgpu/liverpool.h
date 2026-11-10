@@ -120,6 +120,39 @@ public:
         }
     }
 
+    // LBP3 Recompiled: the same release rules as WaitGpuIdleOrBlocked, but for the graphics
+    // queue alone. A graphics submit returns once the graphics queue has run what it was
+    // given or blocks on a wait; a blocked compute queue no longer lets it return before the
+    // graphics queue has even started (the game then raced ahead and reset the flag the new
+    // command buffer's first WAIT_REG_MEM checks: ticket 10's save deadlock).
+    void WaitGfxIdleOrBlocked() noexcept {
+        using namespace std::chrono_literals;
+        std::unique_lock lk{submit_mutex};
+        std::chrono::steady_clock::time_point blocked_since{};
+        while (num_gfx_submits != 0) {
+            if (gfx_blocked_on_wait > 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const u64 addr = gfx_last_blocked_addr;
+                const bool known = addr && std::find(guest_written_waits.begin(), guest_written_waits.end(),
+                                                     addr) != guest_written_waits.end();
+                if (known) {
+                    ++early_releases;
+                    return;
+                }
+                if (blocked_since == std::chrono::steady_clock::time_point{}) {
+                    blocked_since = now;
+                } else if (now - blocked_since >= 20ms) {
+                    ++grace_releases;
+                    ++early_releases;
+                    return;
+                }
+            } else {
+                blocked_since = {};
+            }
+            submit_cv.wait_for(lk, 1ms);
+        }
+    }
+
     bool IsGpuIdle() const {
         return num_submits == 0;
     }
@@ -272,6 +305,9 @@ private:
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::atomic<u32> queues_blocked_on_wait{};
+    std::atomic<u32> num_gfx_submits{};        // graphics submissions not finished yet
+    std::atomic<u32> gfx_blocked_on_wait{};    // the graphics queue is blocked on a wait
+    std::atomic<u64> gfx_last_blocked_addr{};
     std::atomic<u64> last_blocked_addr{};      // memory address of the latest blocked wait (0: register)
     std::vector<u64> guest_written_waits;      // wait addresses that needed an early release
 
@@ -283,8 +319,9 @@ private:
         u64 addr;
         u32 label_writes;    // label write count at the start
         u32 grace_releases;  // grace_releases at the start
+        bool gfx;            // on the graphics queue
     };
-    BlockedWait BeginBlockedWait(u64 addr);
+    BlockedWait BeginBlockedWait(u64 addr, bool gfx = false);
     // The wait ended. If the guest had to be released to end it and no command stream
     // wrote the address meanwhile, the guest's CPU wrote it: remember the address. If a
     // command stream wrote it, forget it (a GPU-side label must be waited out).

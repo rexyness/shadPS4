@@ -60,7 +60,14 @@ struct LabelWrite {
 static std::array<LabelWrite, 64> recent_label_writes{};
 static std::atomic<u32> recent_label_write_count{};
 
+} // namespace AmdGpu
+namespace hle::kernel {
+void SyncRecGpu(const char* what, uint64_t a, uint64_t b);  // runtime: LBP3_TRACE_SYNC ring
+}
+namespace AmdGpu {
+
 static void NoteLabelWrite(const char* source, u64 address, u64 data) {
+    hle::kernel::SyncRecGpu(source, address, data);
     recent_label_writes[recent_label_write_count++ % recent_label_writes.size()] = {source,
                                                                                     address, data};
 }
@@ -76,17 +83,40 @@ static bool LabelWrittenSince(u64 address, u32 since) {
     return false;
 }
 
-Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr) {
+
+// LBP3_BREAK_STUCK_WAITS=<ms>: a WAIT_REG_MEM still unsatisfied after <ms> is treated as
+// satisfied and logged (a stopgap to test whether breaking the wait ends a deadlock).
+static bool BreakStuckWait(std::chrono::steady_clock::time_point start, const char* queue, u64 addr) {
+    static const long ms = [] {
+        const char* v = std::getenv("LBP3_BREAK_STUCK_WAITS");
+        return v ? std::atol(v) : 0L;
+    }();
+    if (ms <= 0 || std::chrono::steady_clock::now() - start < std::chrono::milliseconds(ms)) {
+        return false;
+    }
+    std::fprintf(stderr, "[gpu] broke a %s WAIT_REG_MEM on %#llx after %ld ms (LBP3_BREAK_STUCK_WAITS)\n", queue,
+                 static_cast<unsigned long long>(addr), ms);
+    return true;
+}
+
+Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr, bool gfx) {
+    hle::kernel::SyncRecGpu("wait-blocked", addr, 0);
     std::scoped_lock lk{submit_mutex};
     last_blocked_addr = addr;
     ++queues_blocked_on_wait;
+    if (gfx) {
+        gfx_last_blocked_addr = addr;
+        ++gfx_blocked_on_wait;
+    }
     submit_cv.notify_all();
-    return {addr, recent_label_write_count.load(), grace_releases.load()};
+    return {addr, recent_label_write_count.load(), grace_releases.load(), gfx};
 }
 
 void Liverpool::EndBlockedWait(const BlockedWait& wait) {
+    hle::kernel::SyncRecGpu("wait-released", wait.addr, 0);
     std::scoped_lock lk{submit_mutex};
     --queues_blocked_on_wait;
+    if (wait.gfx) --gfx_blocked_on_wait;
     if (!wait.addr) return;
     const auto known = std::find(guest_written_waits.begin(), guest_written_waits.end(), wait.addr);
     if (LabelWrittenSince(wait.addr, wait.label_writes)) {
@@ -216,6 +246,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 queue.submits.pop();
 
                 --num_submits;
+                if (curr_qid == GfxQueueId) --num_gfx_submits;
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
             }
@@ -918,7 +949,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     mem_semaphore->Signal();
                 } else {
                     if (!mem_semaphore->Signaled()) {
-                        const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>());
+                        const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>(), true);
                         const auto wait_start = std::chrono::steady_clock::now();
                         bool reported = false;
                         while (!mem_semaphore->Signaled()) {
@@ -964,11 +995,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
+                hle::kernel::SyncRecGpu("gfx WAIT", wait_reg_mem->Address<u64>(), wait_reg_mem->ref);
                 if (!wait_reg_mem->Test(regs.reg_array)) {
                     // The guest may satisfy this wait only after its submit call returns.
                     const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
                                          ? wait_reg_mem->Address<u64>()
-                                         : 0);
+                                         : 0, true);
                     const auto wait_start = std::chrono::steady_clock::now();
                     bool reported = false;
                     while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -980,6 +1012,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             ReportStuckWait("gfx", wait_reg_mem,
                                             memory ? *wait_reg_mem->Address()
                                                    : regs.reg_array[wait_reg_mem->Reg()]);
+                        }
+                        if (BreakStuckWait(wait_start, "gfx", wait_reg_mem->Address<u64>())) {
+                            break;
                         }
                         YIELD_GFX();
                     }
@@ -1329,6 +1364,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            hle::kernel::SyncRecGpu("compute WAIT", wait_reg_mem->Address<u64>(), wait_reg_mem->ref);
             if (!wait_reg_mem->Test(regs.reg_array)) {
                 const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
                                      ? wait_reg_mem->Address<u64>()
@@ -1344,6 +1380,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         ReportStuckWait("compute", wait_reg_mem,
                                         memory ? *wait_reg_mem->Address()
                                                : regs.reg_array[wait_reg_mem->Reg()]);
+                    }
+                    if (BreakStuckWait(wait_start, "compute", wait_reg_mem->Address<u64>())) {
+                        break;
                     }
                     YIELD_ASC(vqid);
                 }
@@ -1421,6 +1460,7 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+    hle::kernel::SyncRecGpu("SubmitGfx", reinterpret_cast<u64>(dcb.data()), dcb.size());
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -1434,11 +1474,13 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     std::scoped_lock lk{submit_mutex};
+    ++num_gfx_submits;
     ++num_submits;
     submit_cv.notify_one();
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+    hle::kernel::SyncRecGpu("SubmitAsc", gnm_vqid, acb.size());
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     auto& queue = mapped_queues[gnm_vqid];
 
