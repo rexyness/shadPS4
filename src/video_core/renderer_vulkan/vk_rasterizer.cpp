@@ -232,8 +232,10 @@ void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
         }
         u32 blend;
         std::memcpy(&blend, &regs.blend_control[i], 4);
-        std::snprintf(buf, sizeof(buf), " rt%u=%llx(blend %08x)", i, (unsigned long long)cb.Address(),
-                      blend);
+        std::snprintf(buf, sizeof(buf), " rt%u=%llx(blend %08x swap %u fmt %u num %u export %u)", i,
+                      (unsigned long long)cb.Address(), blend, static_cast<u32>(cb.info.comp_swap),
+                      static_cast<u32>(cb.info.format), static_cast<u32>(cb.info.number_type),
+                      static_cast<u32>(regs.color_export_format.GetFormat(i)));
         line += buf;
     }
     const auto& db = regs.depth_buffer;

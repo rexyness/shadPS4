@@ -103,9 +103,17 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8 ||
                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8_8_8);
 
+    // LBP3 gap 6 experiment: LBP3_SWAP_RB_PS=<hex hash> swaps red and blue in that shader's output.
+    static const u64 swap_rb_hash = [] {
+        const char* v = std::getenv("LBP3_SWAP_RB_PS");
+        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    const bool swap_rb = swap_rb_hash && info.pgm_hash == swap_rb_hash;
+
     // Swizzle components and export
     for (u32 i = 0; i < 4; ++i) {
-        const auto swizzled_comp = components[color_buffer.swizzle.Map(i)];
+        const u32 src = swap_rb && (i == 0 || i == 2) ? 2 - i : i;
+        const auto swizzled_comp = components[color_buffer.swizzle.Map(src)];
         if (swizzled_comp.IsEmpty()) {
             continue;
         }

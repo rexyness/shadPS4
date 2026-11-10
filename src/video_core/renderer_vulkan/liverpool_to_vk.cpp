@@ -1154,7 +1154,14 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         break;
     }
 
-    color.float32 = comp_swizzle.Apply(color.float32);
+    // LBP3 gap 6 experiment: LBP3_CLEAR_SWIZZLE=off decodes the clear word without the CB swizzle.
+    static const bool clear_swizzle = [] {
+        const char* v = std::getenv("LBP3_CLEAR_SWIZZLE");
+        return !v || std::string(v) != "off";
+    }();
+    if (clear_swizzle) {
+        color.float32 = comp_swizzle.Apply(color.float32);
+    }
     return {.color = color};
 }
 
