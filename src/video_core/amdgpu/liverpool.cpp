@@ -76,17 +76,22 @@ static bool LabelWrittenSince(u64 address, u32 since) {
     return false;
 }
 
-Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr) {
+Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr, bool gfx) {
     std::scoped_lock lk{submit_mutex};
     last_blocked_addr = addr;
     ++queues_blocked_on_wait;
+    if (gfx) {
+        gfx_last_blocked_addr = addr;
+        ++gfx_blocked_on_wait;
+    }
     submit_cv.notify_all();
-    return {addr, recent_label_write_count.load(), grace_releases.load()};
+    return {addr, recent_label_write_count.load(), grace_releases.load(), gfx};
 }
 
 void Liverpool::EndBlockedWait(const BlockedWait& wait) {
     std::scoped_lock lk{submit_mutex};
     --queues_blocked_on_wait;
+    if (wait.gfx) --gfx_blocked_on_wait;
     if (!wait.addr) return;
     const auto known = std::find(guest_written_waits.begin(), guest_written_waits.end(), wait.addr);
     if (LabelWrittenSince(wait.addr, wait.label_writes)) {
@@ -216,6 +221,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 queue.submits.pop();
 
                 --num_submits;
+                if (curr_qid == GfxQueueId) --num_gfx_submits;
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
             }
@@ -918,7 +924,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     mem_semaphore->Signal();
                 } else {
                     if (!mem_semaphore->Signaled()) {
-                        const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>());
+                        const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>(), true);
                         const auto wait_start = std::chrono::steady_clock::now();
                         bool reported = false;
                         while (!mem_semaphore->Signaled()) {
@@ -968,7 +974,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // The guest may satisfy this wait only after its submit call returns.
                     const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
                                          ? wait_reg_mem->Address<u64>()
-                                         : 0);
+                                         : 0, true);
                     const auto wait_start = std::chrono::steady_clock::now();
                     bool reported = false;
                     while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1434,6 +1440,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     std::scoped_lock lk{submit_mutex};
+    ++num_gfx_submits;
     ++num_submits;
     submit_cv.notify_one();
 }
