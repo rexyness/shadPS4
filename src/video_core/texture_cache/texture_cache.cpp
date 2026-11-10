@@ -29,6 +29,10 @@ static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 std::atomic<u32> g_lbp3ImageCreates{};
 std::atomic<u32> g_lbp3ImageExpands{};
 std::atomic<u32> g_lbp3ImageReadbacks{};  // images written back for the CPU (status line)
+// LBP3: the game's "capture job queued" byte (eboot 0x132d699), from the time a capture is
+// queued until its job has copied the pixels out four frames later. Set by the runtime when
+// the eboot's code matches (gpu/renderer.cpp); null otherwise.
+std::atomic<const volatile u8*> g_lbp3CaptureQueued{};
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -76,11 +80,18 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
-    for (const ImageId image_id : download_images) {
-        if (True(slot_images[image_id].flags & ImageFlagBits::GpuModified)) {
-            ++g_lbp3ImageReadbacks;
+    // Without readbackLinearImages the set holds only capture-target candidates (FindRenderTarget),
+    // which are downloaded only while the game has a capture queued. Other linear 32-bit targets
+    // stay on the GPU: a Bunkum cutscene draws one 1920x2160 over the pool the captures use, and
+    // a synchronous download of it took 118 ms.
+    const volatile u8* capture = g_lbp3CaptureQueued.load(std::memory_order_relaxed);
+    if (readback_linear_images || (capture && *capture != 0)) {
+        for (const ImageId image_id : download_images) {
+            if (True(slot_images[image_id].flags & ImageFlagBits::GpuModified)) {
+                ++g_lbp3ImageReadbacks;
+            }
+            DownloadImageMemory(image_id, true);
         }
-        DownloadImageMemory(image_id, true);
     }
     download_images.clear();
 }
@@ -688,9 +699,10 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 // (1280x720, 640x360 and 320x180 at a 720p render size), and the game copies them out with a
 // plain memcpy a few frames later (eboot 0x4014f0), with no fence or label in between. Unless
 // the image is written back to guest memory, that copy reads zeros and the photo is black.
-// Such targets are downloaded (synchronously, at the submit or fence after the draw) even
-// without LBP3_READBACK_IMAGES. The game's other linear targets are 64-wide R8 ones drawn every
-// frame and a 3D storage volume, which stay on the GPU; LBP3_READBACK_IMAGES downloads those too.
+// Such targets are queued here and downloaded (synchronously, at the submit or fence after the
+// draw) while the game has a capture job queued (ProcessDownloadImages), even without
+// LBP3_READBACK_IMAGES. The game's other linear targets (64-wide R8 ones drawn every frame, a 3D
+// storage volume) are never queued; LBP3_READBACK_IMAGES downloads every linear target.
 static bool IsCpuReadRenderTarget(const ImageInfo& info) {
     return !info.props.is_tiled && !info.props.is_depth && info.num_bits == 32 &&
            info.num_samples == 1 && info.size.depth == 1 && info.resources.layers == 1 &&
