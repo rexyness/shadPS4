@@ -10,8 +10,6 @@
 
 namespace Vulkan {
 
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
-
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
         vk::SemaphoreCreateInfo{},
@@ -63,12 +61,24 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
+    // LBP3 Recompiled: wait in 1 s steps so a wait that never ends gets reported. A lost
+    // device never signals: report it instead of spinning forever.
+    constexpr u64 kStepNs = 1'000'000'000;
+    int waited_s = 0;
+    bool logged_result = false;
     vk::Result result;
-    while ((result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT)) !=
-           vk::Result::eSuccess) {
-        // LBP3 Recompiled: a lost device never signals; report it instead of spinning forever.
+    while ((result = instance.GetDevice().waitSemaphores(&wait_info, kStepNs)) != vk::Result::eSuccess) {
         if (result == vk::Result::eErrorDeviceLost) {
             Lbp3Checkpoints::OnDeviceLost(instance.GetGraphicsQueue(), "Semaphore::Wait", tick);
+        }
+        if (result != vk::Result::eTimeout && !logged_result) {
+            logged_result = true;
+            std::fprintf(stderr, "[gpu] Semaphore::Wait: waitSemaphores returned %s\n",
+                         vk::to_string(result).c_str());
+        }
+        if (++waited_s == 5) {
+            Lbp3Checkpoints::OnLongWait(instance.GetGraphicsQueue(), "Semaphore::Wait", tick, waited_s,
+                                        static_cast<int>(result));
         }
     }
     Refresh();

@@ -77,6 +77,41 @@ inline void PrintRecord(u64 seq, const char* tag) {
                  (unsigned long long)r.h0, (unsigned long long)r.h1, r.a, r.b, r.c);
 }
 
+// Logs the markers that last reached the top and the bottom of the pipe, with the work
+// recorded around them. The data is only defined once the device is lost.
+inline void PrintCheckpoints(vk::Queue queue) {
+    if (!g_on) {
+        std::fprintf(stderr, "[gpu] checkpoints off: run with LBP3_GPU_CHECKPOINTS=1 to name the work\n");
+        return;
+    }
+    u32 count = 0;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(static_cast<VkQueue>(queue), &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+    if (count) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(static_cast<VkQueue>(queue), &count, data.data());
+    }
+    u64 top = 0, bottom = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u64 seq = static_cast<u64>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+        std::fprintf(stderr, "[gpu] checkpoint: stage %s marker #%llu\n",
+                     vk::to_string(vk::PipelineStageFlagBits(data[i].stage)).c_str(),
+                     (unsigned long long)seq);
+        if (data[i].stage == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT && seq > top) top = seq;
+        if (data[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT && seq > bottom) bottom = seq;
+    }
+    // Each marker sits just before its work. Work before the last marker that reached the
+    // bottom of the pipe has finished; work from there up to the last marker that reached
+    // the top of the pipe was in flight when the GPU hung.
+    const u64 from = bottom > 4 ? bottom - 4 : 1;
+    const u64 to = std::max(top, bottom) + 4;
+    std::fprintf(stderr, "[gpu] in flight: from #%llu (bottom of pipe) to #%llu (top of pipe)\n",
+                 (unsigned long long)bottom, (unsigned long long)top);
+    for (u64 s = from; s <= to && s <= g_seq.load() && s - from < 400; ++s) {
+        PrintRecord(s, s < bottom ? "done     " : s <= top ? "IN FLIGHT" : "not begun");
+    }
+    std::fflush(stderr);
+}
+
 // Called once the device is lost. Never returns.
 [[noreturn]] inline void OnDeviceLost(vk::Queue queue, const char* where, u64 tick) {
     static std::atomic<bool> once{false};
@@ -89,37 +124,21 @@ inline void PrintRecord(u64 seq, const char* tag) {
                  "[gpu] Vulkan device lost in %s (tick %llu): the driver reset the GPU "
                  "(Windows TDR). Last marker recorded: #%llu\n",
                  where, (unsigned long long)tick, (unsigned long long)g_seq.load());
-    if (!g_on) {
-        std::fprintf(stderr, "[gpu] checkpoints off: run with LBP3_GPU_CHECKPOINTS=1 to name the work\n");
-    } else {
-        u32 count = 0;
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(static_cast<VkQueue>(queue), &count, nullptr);
-        std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
-        if (count) {
-            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(static_cast<VkQueue>(queue), &count, data.data());
-        }
-        u64 top = 0, bottom = 0;
-        for (u32 i = 0; i < count; ++i) {
-            const u64 seq = static_cast<u64>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
-            std::fprintf(stderr, "[gpu] checkpoint: stage %s marker #%llu\n",
-                         vk::to_string(vk::PipelineStageFlagBits(data[i].stage)).c_str(),
-                         (unsigned long long)seq);
-            if (data[i].stage == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT && seq > top) top = seq;
-            if (data[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT && seq > bottom) bottom = seq;
-        }
-        // Each marker sits just before its work. Work before the last marker that reached the
-        // bottom of the pipe has finished; work from there up to the last marker that reached
-        // the top of the pipe was in flight when the GPU hung.
-        const u64 from = bottom > 4 ? bottom - 4 : 1;
-        const u64 to = std::max(top, bottom) + 4;
-        std::fprintf(stderr, "[gpu] in flight: from #%llu (bottom of pipe) to #%llu (top of pipe)\n",
-                     (unsigned long long)bottom, (unsigned long long)top);
-        for (u64 s = from; s <= to && s <= g_seq.load() && s - from < 400; ++s) {
-            PrintRecord(s, s < bottom ? "done     " : s <= top ? "IN FLIGHT" : "not begun");
-        }
-    }
+    PrintCheckpoints(queue);
     std::fflush(stderr);
     std::_Exit(3);
+}
+
+// A wait that has gone on for seconds without a lost device: report once and keep waiting.
+inline void OnLongWait(vk::Queue queue, const char* where, u64 tick, int seconds, int result) {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[gpu] %s has waited %d s for tick %llu (last result %d); last marker recorded: #%llu\n",
+                 where, seconds, (unsigned long long)tick, result, (unsigned long long)g_seq.load());
+    PrintCheckpoints(queue);
 }
 
 } // namespace Vulkan::Lbp3Checkpoints
