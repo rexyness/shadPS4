@@ -390,6 +390,20 @@ public:
         return properties.limits.maxViewportDimensions[1];
     }
 
+    /// LBP3 Recompiled (gap 15): geometry-stage limits, for the GS output guard.
+    u32 GetMaxGeometryOutputVertices() const {
+        return properties.limits.maxGeometryOutputVertices;
+    }
+    u32 GetMaxGeometryOutputComponents() const {
+        return properties.limits.maxGeometryOutputComponents;
+    }
+    u32 GetMaxGeometryTotalOutputComponents() const {
+        return properties.limits.maxGeometryTotalOutputComponents;
+    }
+    u32 GetMaxGeometryInputComponents() const {
+        return properties.limits.maxGeometryInputComponents;
+    }
+
     /// Returns the maximum render area width.
     u32 GetMaxFramebufferWidth() const {
         return properties.limits.maxFramebufferWidth;

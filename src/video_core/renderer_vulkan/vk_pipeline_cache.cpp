@@ -146,7 +146,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     case HwStage::Geometry: {
         BuildCommon(regs.gs_program);
         info.hw.gs.num_outputs = MapOutputs(info.hw.gs.outputs, regs.vs_output_control);
-        info.hw.gs.output_vertices = regs.vgt_gs_max_vert_out;
+        // LBP3 Recompiled (gap 15): VGT_GS_MAX_VERT_OUT is the game's ring budget (LBP3 sets 64
+        // for every GS), not what the shader writes. Declaring 64 put LBP3's geometry shaders
+        // (4 vertices of 24 or 40 components) over NVIDIA's 1024 total output components, and
+        // the GPU faulted on the first draw (Xid 13, "Shader Program Header 8 Error"). The copy
+        // shader's vertex stride is the real count (the rule upstream used before #5072, here
+        // also for the declared OutputVertices). Set here, not only at SPIR-V emission, so the
+        // permutation compare (runtime_info.h) never reuses a cached 64-vertex module.
+        const auto params_vc = AmdGpu::GetParams(regs.vs_program);
+        info.hw.gs.output_vertices = Lbp3GsOutputVertices(
+            regs.vgt_gs_max_vert_out, Lbp3CopyShader(params_vc.code, params_vc.hash));
         info.hw.gs.num_invocations =
             regs.vgt_gs_instance_cnt.IsEnabled() ? regs.vgt_gs_instance_cnt.count : 1;
         if (regs.stage_enable.raw == AmdGpu::ShaderStageEnable::LsHsEsGs) {
@@ -173,7 +182,6 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.gs.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         info.hw.gs.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
         info.hw.gs.mode = regs.vgt_gs_mode.mode;
-        const auto params_vc = AmdGpu::GetParams(regs.vs_program);
         info.hw.gs.vs_copy = params_vc.code;
         info.hw.gs.vs_copy_hash = params_vc.hash;
         DumpShader(info.hw.gs.vs_copy, info.hw.gs.vs_copy_hash, Shader::HwStage::Vertex, 0,
@@ -353,6 +361,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    // LBP3 Recompiled (gap 15): the limits the GS output guard checks against.
+    std::fprintf(stderr,
+                 "[gpu] geometry limits: %u output vertices, %u output components per vertex, %u "
+                 "total output components, %u input components (geometry stage %s)\n",
+                 instance.GetMaxGeometryOutputVertices(), instance.GetMaxGeometryOutputComponents(),
+                 instance.GetMaxGeometryTotalOutputComponents(),
+                 instance.GetMaxGeometryInputComponents(),
+                 instance.IsGeometryStageSupported() ? "supported" : "not supported");
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -407,7 +423,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             reason = "unimplemented stage set";
             break;
         }
-        char line[512];
+        if (!lbp3_drop_reason.empty()) {
+            reason = lbp3_drop_reason.c_str(); // the GS output guard's own reason
+        }
+        char line[768];
         std::snprintf(line, sizeof(line),
                       "[gpu] dropped draw: %s; stages 0x%x, ES 0x%llx, GS 0x%llx, VS 0x%llx, PS 0x%llx, PS hash "
                       "0x%llx, primitive %u, GS mode 0x%x, streamout 0x%x",
@@ -483,6 +502,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
+    lbp3_drop_reason.clear(); // LBP3 Recompiled (gap 15): set only by the GS guard below
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -583,6 +603,122 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
+// LBP3 Recompiled (gap 15): the geometry-shader output, from the copy shader and the device.
+
+const PipelineCache::Lbp3CopyShaderInfo& PipelineCache::Lbp3CopyShader(std::span<const u32> code,
+                                                                       u64 hash) {
+    auto [it, is_new] = lbp3_copy_shaders.try_emplace(hash);
+    if (!is_new) {
+        return it->second;
+    }
+    Lbp3CopyShaderInfo copy{};
+    // ParseCopyShader asserts on anything else; its first instruction is s_mov_b32 vcc_hi, #imm.
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    if (code.data() && !code.empty() && code[0] == token_mov_vcchi) {
+        const auto data = Shader::ParseCopyShader(code);
+        copy.valid = true;
+        copy.output_vertices = data.output_vertices;
+        copy.num_attrs = data.num_attrs;
+        copy.num_comps = data.num_comps;
+        // Position1..3 exports become misc (point size, layer, viewport) or clip/cull distance
+        // outputs; count each as a full 8-float array, to stay on the safe side of the limit.
+        std::set<u32> misc;
+        for (const auto& [ofs, target] : data.attr_map) {
+            const auto attr = target.first;
+            if (Shader::IR::IsPosition(attr) && attr != Shader::IR::Attribute::Position0) {
+                misc.insert(static_cast<u32>(attr));
+            }
+        }
+        copy.extra_comps = 8 * static_cast<u32>(misc.size());
+    }
+    it.value() = copy;
+    return it->second;
+}
+
+u32 PipelineCache::Lbp3GsOutputVertices(u32 max_vert_out, const Lbp3CopyShaderInfo& copy) const {
+    if (copy.output_vertices && copy.output_vertices < max_vert_out) {
+        return copy.output_vertices;
+    }
+    return max_vert_out;
+}
+
+bool PipelineCache::Lbp3GsWithinLimits(u32 output_vertices, const Lbp3CopyShaderInfo& copy,
+                                       u32 esgs_itemsize, const char* when) {
+    // Components per emitted vertex as the SPIR-V declares them: gl_Position, one vec4 per
+    // copy-shader parameter, and the misc/clip/cull outputs. Inputs: one vec4 location per
+    // vec4 of the ES->GS ring item, less one (spirv_emit_context.cpp).
+    const u32 comps = 4 + 4 * copy.num_attrs + copy.extra_comps;
+    const u64 total = u64(output_vertices) * comps;
+    const u32 in_comps = esgs_itemsize >= 4 ? 4 * (esgs_itemsize / 4 - 1) : 0;
+    const u32 max_vertices = instance.GetMaxGeometryOutputVertices();
+    const u32 max_comps = instance.GetMaxGeometryOutputComponents();
+    const u32 max_total = instance.GetMaxGeometryTotalOutputComponents();
+    const u32 max_in = instance.GetMaxGeometryInputComponents();
+    const char* over = !copy.valid                    ? "copy shader not recognised"
+                       : output_vertices > max_vertices ? "output vertices"
+                       : comps > max_comps              ? "output components per vertex"
+                       : total > max_total              ? "total output components"
+                       : in_comps > max_in              ? "input components"
+                                                        : nullptr;
+    if (!over) {
+        return true;
+    }
+    char reason[320];
+    std::snprintf(reason, sizeof(reason),
+                  "GS output over the device limit (%s, %s): %u vertices x %u components = %llu "
+                  "(limits %u vertices, %u per vertex, %u total), %u input components (limit %u)",
+                  over, when, output_vertices, comps, static_cast<unsigned long long>(total),
+                  max_vertices, max_comps, max_total, in_comps, max_in);
+    lbp3_drop_reason = reason;
+    return false;
+}
+
+// Before any stage of an ES+GS draw is compiled: what the GS would declare must fit the device.
+bool PipelineCache::Lbp3GsGuardBeforeCompile() {
+    const auto& regs = liverpool->regs;
+    // Without both programs bind_stage fails as before (LBP3_GS_STAGES off: no ES program), and
+    // the copy shader isn't even parsed, so the default path is unchanged.
+    const auto* es = regs.ProgramForStage(static_cast<u32>(Shader::HwStage::Export));
+    const auto* gs = regs.ProgramForStage(static_cast<u32>(Shader::HwStage::Geometry));
+    if (!es || !es->Address<u32*>() || !gs || !gs->Address<u32*>()) {
+        return true;
+    }
+    if (!regs.vs_program.Address<u32*>()) {
+        lbp3_drop_reason = "GS copy shader (VS program) not set";
+        return false;
+    }
+    const auto params_vc = AmdGpu::GetParams(regs.vs_program);
+    const auto& copy = Lbp3CopyShader(params_vc.code, params_vc.hash);
+    return Lbp3GsWithinLimits(Lbp3GsOutputVertices(regs.vgt_gs_max_vert_out, copy), copy,
+                              regs.vgt_esgs_ring_itemsize, "before compiling");
+}
+
+// After the GS is bound: the permutation actually picked (possibly one loaded from the shader
+// cache at boot) must fit too. A 64-vertex module cached before the fix can't be picked for a
+// draw that now declares 4 (its specialization differs, so the draw gets a new permutation and
+// pipeline key), but this check doesn't rely on that.
+bool PipelineCache::Lbp3GsGuardSelectedPermutation() {
+    const auto& regs = liverpool->regs;
+    const auto* pgm = regs.ProgramForStage(static_cast<u32>(Shader::HwStage::Geometry));
+    if (!pgm || !pgm->Address<u32*>() || !regs.vs_program.Address<u32*>()) {
+        return true;
+    }
+    const auto it = program_cache.find(AmdGpu::GetParams(*pgm).hash);
+    if (it == program_cache.end()) {
+        return true;
+    }
+    const auto module = modules[static_cast<u32>(Shader::SwStage::Geometry)];
+    const auto params_vc = AmdGpu::GetParams(regs.vs_program);
+    const auto& copy = Lbp3CopyShader(params_vc.code, params_vc.hash);
+    for (const auto& permutation : it->second->modules) {
+        if (permutation.module == module) {
+            return Lbp3GsWithinLimits(permutation.spec.runtime_info.hw.gs.output_vertices, copy,
+                                      regs.vgt_esgs_ring_itemsize, "selected permutation");
+        }
+    }
+    return true;
+}
+
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -630,10 +766,16 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
+        if (!Lbp3GsGuardBeforeCompile()) { // LBP3 Recompiled (gap 15)
+            return false;
+        }
         if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
             return false;
         }
         if (!bind_stage(HwStage::Geometry, SwStage::Geometry)) {
+            return false;
+        }
+        if (!Lbp3GsGuardSelectedPermutation()) {
             return false;
         }
         break;
@@ -663,6 +805,9 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
+        if (!Lbp3GsGuardBeforeCompile()) { // LBP3 Recompiled (gap 15)
+            return false;
+        }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
             return false;
         }
@@ -673,6 +818,9 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
         if (!bind_stage(HwStage::Geometry, SwStage::Geometry)) {
+            return false;
+        }
+        if (!Lbp3GsGuardSelectedPermutation()) {
             return false;
         }
         break;

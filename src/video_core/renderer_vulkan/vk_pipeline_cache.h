@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <span>
+#include <string>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -114,6 +116,27 @@ private:
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
+    // LBP3 Recompiled (gap 15): what a geometry shader's copy shader says about its output,
+    // parsed once per copy shader (the shader cache doesn't keep Info::gs_copy_data, so a GS
+    // loaded from the cache has no attribute count of its own).
+    struct Lbp3CopyShaderInfo {
+        bool valid{};          // the VS program is a recognisable copy shader
+        u32 output_vertices{}; // vertices the GS really writes per primitive (0 = unknown)
+        u32 num_attrs{};       // vec4 parameter outputs
+        u32 extra_comps{};     // conservative count for misc/clip/cull outputs
+        u32 num_comps{};       // dwords per vertex the copy shader reads
+    };
+    const Lbp3CopyShaderInfo& Lbp3CopyShader(std::span<const u32> code, u64 hash);
+    // The GS output vertex count to declare: the game's VGT_GS_MAX_VERT_OUT is a ring budget
+    // (64 in LBP3), the copy shader's count is what the GS writes (4).
+    u32 Lbp3GsOutputVertices(u32 max_vert_out, const Lbp3CopyShaderInfo& copy) const;
+    // False (and lbp3_drop_reason set) when a GS with this output would exceed the device's
+    // geometry limits; the draw is then dropped instead of faulting the GPU.
+    bool Lbp3GsWithinLimits(u32 output_vertices, const Lbp3CopyShaderInfo& copy,
+                            u32 esgs_itemsize, const char* when);
+    bool Lbp3GsGuardBeforeCompile();
+    bool Lbp3GsGuardSelectedPermutation();
+
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
@@ -138,6 +161,9 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    // LBP3 Recompiled (gap 15)
+    tsl::robin_map<u64, Lbp3CopyShaderInfo> lbp3_copy_shaders;
+    std::string lbp3_drop_reason; // why RefreshGraphicsKey failed, when the GS guard says so
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
