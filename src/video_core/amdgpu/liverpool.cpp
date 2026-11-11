@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string_view>
+
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -225,13 +228,33 @@ void Liverpool::Process(std::stop_token stoken) {
             if (task.done()) {
                 task.destroy();
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
+                const bool gfx_done = curr_qid == GfxQueueId;
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
 
-                --num_submits;
-                if (curr_qid == GfxQueueId) --num_gfx_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                    --num_submits;
+                    if (gfx_done) --num_gfx_submits;
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+                // LBP3 (milestone 5): hand the work recorded so far to the GPU as each graphics
+                // command buffer finishes, so the GPU runs a frame's first buffers while this
+                // thread records the rest, instead of starting only at the frame's readback.
+                // A flush submits without waiting; the game is still released only when the
+                // graphics queue is idle (ticket 10). LBP3_GPU_FLUSH=off restores the old
+                // behaviour; LBP3_GPU_FLUSH=<n> flushes after every n-th graphics buffer.
+                static const int flush_every = [] {
+                    const char* v = std::getenv("LBP3_GPU_FLUSH");
+                    if (!v) return 1;
+                    if (std::string_view{v} == "off") return 0;
+                    const int n = std::atoi(v);
+                    return n > 0 ? n : 1;
+                }();
+                static int gfx_buffers = 0;
+                if (gfx_done && flush_every && rasterizer && ++gfx_buffers % flush_every == 0) {
+                    rasterizer->Flush();
+                }
             }
         }
 
