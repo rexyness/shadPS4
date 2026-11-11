@@ -3,7 +3,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
 #include <ranges>
+#include <set>
+#include <string>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -32,6 +37,9 @@ std::atomic<u32> g_lbp3ShaderCompiles{};
 std::atomic<u64> g_lbp3ShaderCompileUs{};
 std::atomic<u32> g_lbp3PipelineCompiles{};
 std::atomic<u64> g_lbp3PipelineCompileUs{};
+// LBP3 Recompiled (gap 15): draws dropped because no graphics pipeline could be keyed
+// (RefreshGraphicsKey false). Counted per [perf] window; each distinct case is logged once.
+std::atomic<u32> g_lbp3DroppedDraws{};
 
 namespace {
 u64 Lbp3UsSince(std::chrono::steady_clock::time_point start) {
@@ -358,6 +366,65 @@ PipelineCache::~PipelineCache() = default;
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
+        // LBP3 Recompiled (gap 15): every such draw used to vanish without a word. Count it, and
+        // log each distinct case once: the stage set, why it failed (worked out from the
+        // registers as RefreshGraphicsStages checks them), the program addresses and the pixel
+        // shader's hash.
+        ++g_lbp3DroppedDraws;
+        const auto& regs = liverpool->regs;
+        const auto addr = [&](Shader::HwStage s) -> u64 {
+            const auto* pgm = regs.ProgramForStage(static_cast<u32>(s));
+            return pgm ? reinterpret_cast<u64>(pgm->Address<u32*>()) : 0;
+        };
+        u32 gs_mode = 0;
+        std::memcpy(&gs_mode, &regs.vgt_gs_mode, sizeof(gs_mode));
+        const u32 stages = static_cast<u32>(regs.stage_enable.raw);
+        const bool gs_unsupported = !instance.IsGeometryStageSupported();
+        const bool gs_features = regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw;
+        const char* reason = "unknown";
+        switch (regs.stage_enable.raw) {
+        case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
+            reason = gs_unsupported                     ? "no geometry stage on this device"
+                     : gs_features                      ? "on-chip GS or streamout"
+                     : !addr(Shader::HwStage::Export)   ? "ES (export) program not set"
+                     : !addr(Shader::HwStage::Geometry) ? "GS program not set"
+                                                        : "unknown (ES+GS)";
+            break;
+        case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
+            reason = !instance.IsTessellationSupported() ? "no tessellation on this device"
+                     : !addr(Shader::HwStage::Hull)       ? "HS program not set"
+                     : !addr(Shader::HwStage::Vertex)     ? "VS (as TES) program not set"
+                     : !addr(Shader::HwStage::Local)      ? "LS program not set"
+                                                          : "unknown (LS+HS)";
+            break;
+        case AmdGpu::ShaderStageEnable::VgtStages::LsHsEsGs:
+            reason = "LS+HS+ES+GS stage set";
+            break;
+        case AmdGpu::ShaderStageEnable::VgtStages::Vs:
+            reason = "VS stage set (a key check other than the stages)";
+            break;
+        default:
+            reason = "unimplemented stage set";
+            break;
+        }
+        char line[512];
+        std::snprintf(line, sizeof(line),
+                      "[gpu] dropped draw: %s; stages 0x%x, ES 0x%llx, GS 0x%llx, VS 0x%llx, PS 0x%llx, PS hash "
+                      "0x%llx, primitive %u, GS mode 0x%x, streamout 0x%x",
+                      reason, stages, static_cast<unsigned long long>(addr(Shader::HwStage::Export)),
+                      static_cast<unsigned long long>(addr(Shader::HwStage::Geometry)),
+                      static_cast<unsigned long long>(addr(Shader::HwStage::Vertex)),
+                      static_cast<unsigned long long>(addr(Shader::HwStage::Fragment)),
+                      static_cast<unsigned long long>(
+                          graphics_key.stage_hashes[static_cast<u32>(Shader::SwStage::Fragment)]),
+                      static_cast<u32>(regs.primitive_type), gs_mode,
+                      static_cast<u32>(regs.vgt_strmout_config.raw));
+        static std::mutex lbp3_seen_mutex;
+        static std::set<std::string> lbp3_seen;
+        std::lock_guard lk(lbp3_seen_mutex);
+        if (lbp3_seen.size() < 256 && lbp3_seen.insert(line).second) {
+            std::fprintf(stderr, "%s\n", line);
+        }
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
