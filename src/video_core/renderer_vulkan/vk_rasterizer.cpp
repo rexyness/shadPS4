@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/lbp3_perf.h"
 
 namespace Vulkan {
 
@@ -45,6 +46,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
+    Lbp3Perf::InitGpu(instance);  // LBP3: milestone 5 GPU timestamps (LBP3_FIRST_FRAME)
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -496,6 +498,9 @@ void Rasterizer::OnFence() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    // LBP3: milestone 5 measurement (draws and dispatches reaching binding, and their binding time).
+    Lbp3Perf::Add(pipeline->IsCompute() ? Lbp3Perf::Dispatches : Lbp3Perf::Draws, 0);
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ResBind);
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;

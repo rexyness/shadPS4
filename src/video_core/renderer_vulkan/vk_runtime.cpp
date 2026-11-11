@@ -5,6 +5,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/lbp3_perf.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -121,7 +122,9 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    const int lbp3_q = Lbp3Perf::GpuBegin(cmdbuf);  // LBP3: milestone 5 measurement
     cmdbuf.copyBuffer(src->Handle(), dst->Handle(), copies);
+    Lbp3Perf::GpuEnd(cmdbuf, lbp3_q, Lbp3Perf::GpuCopy);
 
     for (const auto& copy : copies) {
         AccessBuffer(src, copy.srcOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
@@ -184,8 +187,10 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    const int lbp3_q = Lbp3Perf::GpuBegin(cmdbuf);  // LBP3: milestone 5 measurement
     cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
                              upload_copies);
+    Lbp3Perf::GpuEnd(cmdbuf, lbp3_q, Lbp3Perf::GpuImgUpload);
 
     for (const auto& copy : upload_copies) {
         const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);

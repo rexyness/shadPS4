@@ -7,6 +7,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/types.h"
+#include "video_core/lbp3_perf.h"
 #include "core/devtools/widget/gpu_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -37,6 +38,7 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
                                             bool unsynchronized) {
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::Staging);  // LBP3: milestone 5 measurement
     Ring& ring = rings[u32(type)];
     if (deferred || size > BLOCK_SIZE) {
         return RequestLarge(size, type, deferred, unsynchronized);
@@ -64,6 +66,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best = &ring.blocks[(ring.current + 1) % ring.blocks.size()];
             best_offset = 0;
         } else {
+            Lbp3Perf::Add(Lbp3Perf::StagingNew, 0, BLOCK_SIZE);
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
                                                                     BLOCK_SIZE),
@@ -107,6 +110,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        Lbp3Perf::Add(Lbp3Perf::StagingNew, 0, RoundAllocationSize(size));
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),

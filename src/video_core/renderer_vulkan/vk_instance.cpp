@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/lbp3_perf.h"
 
 #include <vk_mem_alloc.h>
 
@@ -633,16 +634,28 @@ bool Instance::CreateDevice() {
     return true;
 }
 
+// LBP3 Recompiled, milestone 5 measurement: counts VMA's device memory allocations.
+static void VKAPI_PTR Lbp3VmaAllocate(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size,
+                                      void*) {
+    Lbp3Perf::NoteVmaAllocate(size);
+}
+
 void Instance::CreateAllocator() {
     const VmaVulkanFunctions functions = {
         .vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
+    };
+    static const VmaDeviceMemoryCallbacks lbp3_memory_callbacks = {
+        .pfnAllocate = Lbp3VmaAllocate,
+        .pfnFree = nullptr,
+        .pUserData = nullptr,
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        .pDeviceMemoryCallbacks = &lbp3_memory_callbacks,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

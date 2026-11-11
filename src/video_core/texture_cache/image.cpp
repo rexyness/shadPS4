@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/lbp3_perf.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -115,12 +116,14 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ImgAlloc);  // LBP3: milestone 5 measurement
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    lbp3_scope.bytes = alloc_info.size;
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,

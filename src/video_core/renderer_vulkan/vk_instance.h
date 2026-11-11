@@ -222,6 +222,11 @@ public:
         return shader_atomic_float2 && shader_atomic_float2_features.shaderImageFloat32AtomicMinMax;
     }
 
+    /// LBP3 Recompiled: true if queries can be reset from the host (milestone 5 timestamps)
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
     /// Returns true if 64-bit integer atomic operations can be used on buffers
     bool IsBufferInt64AtomicsSupported() const {
         return vk12_features.shaderBufferInt64Atomics;

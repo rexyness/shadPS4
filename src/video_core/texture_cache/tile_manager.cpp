@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/lbp3_perf.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -198,6 +199,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
     }
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::Detile);  // LBP3: milestone 5 measurement
+    lbp3_scope.bytes = info.guest_size;
 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
@@ -268,7 +271,9 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    const int lbp3_q = Lbp3Perf::GpuBegin(cmdbuf);
     cmdbuf.dispatch(dim_x, 1, 1);
+    Lbp3Perf::GpuEnd(cmdbuf, lbp3_q, Lbp3Perf::GpuDetile);
 
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,

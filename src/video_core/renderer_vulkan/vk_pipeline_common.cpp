@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#include "video_core/lbp3_perf.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -21,6 +22,7 @@ Pipeline::~Pipeline() = default;
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::DescBind);  // LBP3: milestone 5 measurement
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;

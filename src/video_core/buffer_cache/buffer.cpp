@@ -6,6 +6,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/lbp3_perf.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -99,6 +100,8 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
 
         const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
         VkBuffer unsafe_buffer{};
+        Lbp3Perf::Scope lbp3_scope(Lbp3Perf::BufAlloc);  // LBP3: milestone 5 measurement
+        lbp3_scope.bytes = buffer_ci.size;
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",

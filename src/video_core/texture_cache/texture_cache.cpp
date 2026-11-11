@@ -19,6 +19,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/lbp3_perf.h"
 
 namespace VideoCore {
 
@@ -539,6 +540,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     LOG_WARNING(Render_Vulkan, "ExpandImage: {} -> {}", DescribeInfo(slot_images[image_id].info),
                 DescribeInfo(info));
     ++g_lbp3ImageExpands;
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::Expand);  // LBP3: milestone 5 measurement
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
@@ -634,6 +636,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Create and register a new image
     if (!image_id) {
         ++g_lbp3ImageCreates;
+        Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ImgNew);  // LBP3: milestone 5 measurement
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -845,6 +848,8 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ImgRefresh);  // LBP3: milestone 5 measurement
+    lbp3_scope.bytes = image.info.guest_size;
     scheduler.EndRendering();
 
     const auto [in_buffer, in_offset] =

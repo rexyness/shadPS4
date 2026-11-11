@@ -8,6 +8,7 @@
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/lbp3_perf.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -226,6 +227,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const auto* last_arena = address_space[last_page];
     if (first_arena == last_arena) {
         if (!first_arena) {
+            Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ArenaNew);
             const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
             const u64 num_pages = last_page - first_page + 1;
             const auto* new_arena =
@@ -238,6 +240,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     }
 
     LOG_WARNING(Render, "Migrating arena");
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ArenaNew);
 
     const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
     const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
@@ -281,6 +284,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         return;
     }
+    Lbp3Perf::Scope lbp3_scope(Lbp3Perf::Resident);  // LBP3: milestone 5 measurement
+    lbp3_scope.bytes = u64(resident_blocks) << block_shift;
 
     const vk::MemoryAllocateFlagsInfo alloc_flags = {
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
@@ -339,6 +344,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         total_size_bytes += size;
     });
     if (!copies.empty()) {
+        Lbp3Perf::Scope lbp3_scope(Lbp3Perf::BufSync);  // LBP3: milestone 5 measurement
+        lbp3_scope.bytes = total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
