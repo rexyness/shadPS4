@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <ranges>
 
 #include "common/hash.h"
@@ -21,6 +23,22 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
+
+// LBP3 Recompiled (milestone 5 measurement): first-sight compiles during play, read and reset
+// by the runtime's [video] status line. Shaders: GCN -> SPIR-V -> shader module
+// (CompileModule). Pipelines: building a Vulkan pipeline for a new key (the is_new branches
+// below; boot's WarmUp is not counted). The clock is read only on a miss.
+std::atomic<u32> g_lbp3ShaderCompiles{};
+std::atomic<u64> g_lbp3ShaderCompileUs{};
+std::atomic<u32> g_lbp3PipelineCompiles{};
+std::atomic<u64> g_lbp3PipelineCompileUs{};
+
+namespace {
+u64 Lbp3UsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+}
+} // namespace
 
 using Shader::HwStage;
 using Shader::Output;
@@ -344,6 +362,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        const auto lbp3_start = std::chrono::steady_clock::now();
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -354,6 +373,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
+        ++g_lbp3PipelineCompiles;
+        g_lbp3PipelineCompileUs += Lbp3UsSince(lbp3_start);
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -373,6 +394,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        const auto lbp3_start = std::chrono::steady_clock::now();
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -382,6 +404,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+        ++g_lbp3PipelineCompiles;
+        g_lbp3PipelineCompileUs += Lbp3UsSince(lbp3_start);
 
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = modules[0];
@@ -623,6 +647,14 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    const auto lbp3_start = std::chrono::steady_clock::now();
+    struct Lbp3Count {
+        std::chrono::steady_clock::time_point start;
+        ~Lbp3Count() {
+            ++g_lbp3ShaderCompiles;
+            g_lbp3ShaderCompileUs += Lbp3UsSince(start);
+        }
+    } lbp3_count{lbp3_start};
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");

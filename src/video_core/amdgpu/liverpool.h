@@ -92,7 +92,11 @@ public:
     // with the GPU; only a queue blocked for a grace period releases the guest early. A wait
     // address that once needed that release (the guest writes it after the submit) releases
     // the guest at once from then on, so such frames don't pay the grace period every time.
-    void WaitGpuIdleOrBlocked() noexcept {
+    // LBP3 Recompiled (milestone 5 measurement): how a WaitGpuIdleOrBlocked or
+    // WaitGfxIdleOrBlocked call returned, so the runtime can count releases per call site.
+    enum WaitResult : int { WaitResultIdle = 0, WaitReleasedKnown = 1, WaitReleasedGrace = 2 };
+
+    int WaitGpuIdleOrBlocked() noexcept {
         using namespace std::chrono_literals;
         std::unique_lock lk{submit_mutex};
         std::chrono::steady_clock::time_point blocked_since{};
@@ -104,20 +108,21 @@ public:
                                                      addr) != guest_written_waits.end();
                 if (known) {
                     ++early_releases;
-                    return;
+                    return WaitReleasedKnown;
                 }
                 if (blocked_since == std::chrono::steady_clock::time_point{}) {
                     blocked_since = now;
                 } else if (now - blocked_since >= 20ms) {
                     ++grace_releases;  // EndBlockedWait learns the address if the guest wrote it
                     ++early_releases;
-                    return;
+                    return WaitReleasedGrace;
                 }
             } else {
                 blocked_since = {};
             }
             submit_cv.wait_for(lk, 1ms);
         }
+        return WaitResultIdle;
     }
 
     // LBP3 Recompiled: the same release rules as WaitGpuIdleOrBlocked, but for the graphics
@@ -125,7 +130,7 @@ public:
     // given or blocks on a wait; a blocked compute queue no longer lets it return before the
     // graphics queue has even started (the game then raced ahead and reset the flag the new
     // command buffer's first WAIT_REG_MEM checks: ticket 10's save deadlock).
-    void WaitGfxIdleOrBlocked() noexcept {
+    int WaitGfxIdleOrBlocked() noexcept {
         using namespace std::chrono_literals;
         std::unique_lock lk{submit_mutex};
         std::chrono::steady_clock::time_point blocked_since{};
@@ -137,20 +142,21 @@ public:
                                                      addr) != guest_written_waits.end();
                 if (known) {
                     ++early_releases;
-                    return;
+                    return WaitReleasedKnown;
                 }
                 if (blocked_since == std::chrono::steady_clock::time_point{}) {
                     blocked_since = now;
                 } else if (now - blocked_since >= 20ms) {
                     ++grace_releases;
                     ++early_releases;
-                    return;
+                    return WaitReleasedGrace;
                 }
             } else {
                 blocked_since = {};
             }
             submit_cv.wait_for(lk, 1ms);
         }
+        return WaitResultIdle;
     }
 
     bool IsGpuIdle() const {
@@ -320,6 +326,7 @@ private:
         u32 label_writes;    // label write count at the start
         u32 grace_releases;  // grace_releases at the start
         bool gfx;            // on the graphics queue
+        std::chrono::steady_clock::time_point start;  // LBP3 measurement: when it began
     };
     BlockedWait BeginBlockedWait(u64 addr, bool gfx = false);
     // The wait ended. If the guest had to be released to end it and no command stream
@@ -329,6 +336,13 @@ private:
 
 public:
     std::atomic<u32> early_releases{};  // guest released from a submit while the GPU was blocked
+    // LBP3 Recompiled (milestone 5 measurement): time the graphics queue spent blocked on
+    // WAIT_REG_MEM / MEM_SEMAPHORE waits (from BeginBlockedWait to EndBlockedWait), the number
+    // of such waits, and the time the current graphics wait began (0 = none), for the runtime's
+    // per-frame split.
+    std::atomic<u64> lbp3_gfx_blocked_ns{};
+    std::atomic<u32> lbp3_gfx_blocked_waits{};
+    std::atomic<s64> lbp3_gfx_blocked_since_ns{};
     std::atomic<u32> learned_waits{};   // wait addresses added to guest_written_waits
 
 private:

@@ -80,18 +80,26 @@ Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr, bool gfx) {
     std::scoped_lock lk{submit_mutex};
     last_blocked_addr = addr;
     ++queues_blocked_on_wait;
+    const auto start = std::chrono::steady_clock::now();
     if (gfx) {
         gfx_last_blocked_addr = addr;
         ++gfx_blocked_on_wait;
+        lbp3_gfx_blocked_since_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
     }
     submit_cv.notify_all();
-    return {addr, recent_label_write_count.load(), grace_releases.load(), gfx};
+    return {addr, recent_label_write_count.load(), grace_releases.load(), gfx, start};
 }
 
 void Liverpool::EndBlockedWait(const BlockedWait& wait) {
     std::scoped_lock lk{submit_mutex};
     --queues_blocked_on_wait;
-    if (wait.gfx) --gfx_blocked_on_wait;
+    if (wait.gfx) {
+        --gfx_blocked_on_wait;
+        lbp3_gfx_blocked_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait.start).count());
+        ++lbp3_gfx_blocked_waits;
+        lbp3_gfx_blocked_since_ns = 0;
+    }
     if (!wait.addr) return;
     const auto known = std::find(guest_written_waits.begin(), guest_written_waits.end(), wait.addr);
     if (LabelWrittenSince(wait.addr, wait.label_writes)) {
