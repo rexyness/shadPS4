@@ -10,7 +10,7 @@
 //
 //   F  t flip                                   a flip packet (the file is flushed here)
 //   GB t flip kind addr value ref mask func buf off_end size top
-//      c_state c_addr c_value c_ref c_func c_sat c_pending known
+//      c_state c_addr c_value c_ref c_func c_sat c_pending known fault_n_cum fault_us_cum
 //                                               the graphics queue blocks on a wait.
 //                                               kind wrm/sem; buf: top-level buffer index in
 //                                               the frame; off_end: dwords from the packet to
@@ -19,7 +19,9 @@
 //                                               1 parked on a wait; c_sat 1 if that wait's
 //                                               condition already holds; c_pending: compute
 //                                               submits queued, the parked one included).
-//                                               known: the address is a learned wait address
+//                                               known: the address is a learned wait address;
+//                                               *_cum: guest-thread write-tracking faults and
+//                                               handler time so far (diff two rows for a span)
 //   GE t flip addr value dur polls max_gap gres cres cres_n cadv cpkts cdisp pc sat first
 //      writer writer_t c_state c_addr fault_n fault_us fault_cp_n prot_cp_n prot_cp_us
 //      prot_n prot_us vq_us vp_us vq_cp_us vp_cp_us
@@ -50,7 +52,7 @@
 //   CE t flip addr value dur polls max_gap gres pc sat first writer writer_t
 //   W  t flip src addr data buf off_end         a command-stream label write (buf/off_end: the
 //                                               graphics packet's place, -1 for compute)
-//   I  t flip buf off_end                       a graphics EOP raised its interrupt
+//   I  t flip buf off_end fault_n_cum fault_us_cum   a graphics EOP raised its interrupt
 //   CI t flip pipe                              a compute RELEASE_MEM raised its interrupt
 //   CS t flip tid dwords                        a compute submit arrived (guest thread id)
 //   GS t flip tid dwords                        a graphics buffer was handed over

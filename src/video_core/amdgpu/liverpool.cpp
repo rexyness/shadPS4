@@ -157,12 +157,13 @@ Lbp3Trace::Wait Liverpool::TraceGfxWaitBegin(u32 kind, u64 addr, u32 ref, u32 ma
     }
     const bool known = addr && std::find(guest_written_waits.begin(), guest_written_waits.end(),
                                          addr) != guest_written_waits.end();
-    Row("GB,%lld,%u,%s,%#llx,%#llx,%#x,%#x,%u,%d,%d,%zu,%d,%d,%#llx,%#llx,%#x,%u,%d,%zu,%d\n",
+    Row("GB,%lld,%u,%s,%#llx,%#llx,%#x,%#x,%u,%d,%d,%zu,%d,%d,%#llx,%#llx,%#x,%u,%d,%zu,%d,%llu,%.1f\n",
         Us(w.begin_ns), flips.load(), kind ? "sem" : "wrm", static_cast<unsigned long long>(addr),
         static_cast<unsigned long long>(ReadValue(kind, addr)), ref, mask, func, buf, off_end, size,
         top ? 1 : 0, c.parked ? 1 : 0, static_cast<unsigned long long>(c.addr),
         static_cast<unsigned long long>(c_value), c.ref, c.func, c_sat ? 1 : 0, c_pending,
-        known ? 1 : 0);
+        known ? 1 : 0, static_cast<unsigned long long>(fault_n.load()),
+        DUs(static_cast<s64>(fault_ns.load())));
     return w;
 }
 
@@ -1058,9 +1059,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     },
                     [] {
                         if (Lbp3Trace::On()) {
-                            Lbp3Trace::Row("I,%lld,%u,%d,%d\n", Lbp3Trace::Us(Lbp3Trace::NowNs()),
+                            Lbp3Trace::Row("I,%lld,%u,%d,%d,%llu,%.1f\n",
+                                           Lbp3Trace::Us(Lbp3Trace::NowNs()),
                                            Lbp3Trace::flips.load(), Lbp3Trace::ctx_buf,
-                                           Lbp3Trace::ctx_off_end);
+                                           Lbp3Trace::ctx_off_end,
+                                           static_cast<unsigned long long>(
+                                               Lbp3Trace::fault_n.load()),
+                                           Lbp3Trace::DUs(static_cast<s64>(
+                                               Lbp3Trace::fault_ns.load())));
                         }
                         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                     });
