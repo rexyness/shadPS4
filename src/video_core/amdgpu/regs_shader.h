@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/assert.h"
+#include "common/lbp3_res.h"
 #include "common/types.h"
 #include "shader_recompiler/params.h"
 
@@ -247,13 +248,16 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
     UNREACHABLE_MSG("Shader binary info not found.");
 }
 
-static constexpr Shader::ShaderParams GetParams(const auto& sh) {
+// LBP3: the hash is the cache identity of the shader. With the 1440p rescale on and the shared
+// cache, the rescaled shaders are known by a salted hash (common/lbp3_res.h), so their
+// translations never mix with the 1080p ones in the cache.
+static inline Shader::ShaderParams GetParams(const auto& sh) {
     const auto* code = sh.template Address<u32*>();
     const auto& bininfo = SearchBinaryInfo(code);
     return {
         .user_data = sh.user_data,
         .code = std::span{code, bininfo.length / sizeof(u32)},
-        .hash = bininfo.shader_hash,
+        .hash = Lbp3Res::StoredHash(bininfo.shader_hash),
     };
 }
 

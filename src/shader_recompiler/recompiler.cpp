@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/lbp3_res.h"
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -28,23 +29,12 @@ namespace {
 // the 1920x2160 stacked target's texel) get them rescaled. Both axes scale alike (2560/1920 =
 // 1440/1080 = 4/3), so a literal equal to a 1080p size v (1920, 1080 and their halves,
 // quarters and doubles) becomes v * 4/3 and one equal to 1/v becomes 3/4 of it. The list
-// comes from a scan of the translated cache (perf/res1440.md); any other shader with such a
-// literal is logged once, unchanged, so new ones show up in unseen levels.
-constexpr std::array<u64, 17> kLbp3ResShaders = {
-    0x03101c0edb07dfcaull, 0x0b2a33469cd0355aull, 0x2949baf9d0b695fdull, 0x33c89263dcb0a389ull,
-    0x3a0615bd0d8d3a5eull, 0x3d19e6252d1eb891ull, 0x4d3d6de48b31b76aull, 0x5ed16706fc9e0eb1ull,
-    0x8079a39da0f7bae3ull, 0x8e1db4f9563309a5ull, 0x8f2b909cf6507cebull, 0xb0bb8b371aa7cb79ull,
-    0xc9311bbdd52ae955ull, 0xd7506ff3bef3fd6cull, 0xebb656d6240b4b34ull, 0xec6a8d0b0f8c9aedull,
-    0xfdf2b5d50f5db65dull,
-};
-
+// (Lbp3Res::kShaders, common/lbp3_res.h) comes from a scan of the translated cache
+// (perf/res1440.md); any other shader with such a literal is logged once, unchanged, so new ones
+// show up in unseen levels. With the shared cache the listed shaders arrive here under their
+// salted hash (GetParams), so they are matched in either form.
 bool Lbp3ResShadersOn() {
-    static const bool on = [] {
-        const char* res = std::getenv("LBP3_RES");
-        const char* sh = std::getenv("LBP3_RES_SHADERS");
-        return res && std::strcmp(res, "1440") == 0 && sh && std::strcmp(sh, "1") == 0;
-    }();
-    return on;
+    return Lbp3Res::ShadersOn();
 }
 
 // 0 = not a 1080p size; otherwise the factor to apply (4/3 for a size, 3/4 for a reciprocal).
@@ -60,8 +50,8 @@ float Lbp3ResFactor(float f) {
 
 void Lbp3ScaleResolutionLiterals(std::vector<Gcn::GcnInst>& insts, u64 hash) {
     if (!Lbp3ResShadersOn()) return;
-    bool listed = false;
-    for (const u64 h : kLbp3ResShaders) listed |= h == hash;
+    u64 original = hash;
+    const bool listed = Lbp3Res::IsListed(hash, &original);
     int changed = 0, seen = 0;
     for (auto& inst : insts) {
         for (u32 i = 0; i < inst.src_count && i < inst.src.size(); ++i) {
@@ -77,8 +67,9 @@ void Lbp3ScaleResolutionLiterals(std::vector<Gcn::GcnInst>& insts, u64 hash) {
         }
     }
     if (listed)
-        std::fprintf(stderr, "[res] shader %#018llx: %d 1080p literals scaled for 1440p\n",
-                     static_cast<unsigned long long>(hash), changed);
+        std::fprintf(stderr, "[res] shader %#018llx: %d 1080p literals scaled for 1440p (cache key %#018llx)\n",
+                     static_cast<unsigned long long>(original), changed,
+                     static_cast<unsigned long long>(hash));
     else if (seen)
         std::fprintf(stderr, "[res] shader %#018llx: %d 1080p-like literals, NOT on the list (unchanged)\n",
                      static_cast<unsigned long long>(hash), seen);

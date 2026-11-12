@@ -7,6 +7,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 
+#include "common/lbp3_res.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -96,11 +97,11 @@ void DataBase::Open() {
     }
 
     const auto& game_info = Common::ElfInfo::Instance();
-    // LBP3 (exp/res1440): shaders translated with their 1080p literals rescaled
-    // (LBP3_RES=1440 + LBP3_RES_SHADERS=1) get their own cache, so the normal one stays clean.
+    // LBP3 1440p (LBP3_RES=1440 + LBP3_RES_SHADERS=1): by default the cache is shared with
+    // 1080p, the rescaled shaders being kept apart by their salted hash (common/lbp3_res.h).
+    // LBP3_RES_CACHE=separate keeps the old scheme: the whole cache in <serial>_res1440.
     std::string serial{game_info.GameSerial()};
-    if (const char* res = std::getenv("LBP3_RES"), *sh = std::getenv("LBP3_RES_SHADERS");
-        res && std::string_view{res} == "1440" && sh && std::string_view{sh} == "1") {
+    if (Lbp3Res::ShadersOn() && Lbp3Res::SeparateCache()) {
         serial += "_res1440";
     }
 
