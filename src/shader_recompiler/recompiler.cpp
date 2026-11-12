@@ -12,7 +12,42 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 
+#include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace Shader {
+
+namespace {
+
+// LBP3 exposure diagnostics (issues/17-exposure.md). The bloom bright pass (ps 33c89263) keeps
+// last frame's bloom at 0.7 * (1 - alpha); with LBP3_BLOOM_FEEDBACK=off its 0.7 literals are
+// translated as 0, so the bloom holds only the current frame. A/B only; these translations go
+// to their own cache (cache_storage.cpp).
+void Lbp3BloomFeedbackDiag(std::vector<Gcn::GcnInst>& insts, u64 hash) {
+    static const bool off = [] {
+        const char* v = std::getenv("LBP3_BLOOM_FEEDBACK");
+        return v && std::strcmp(v, "off") == 0;
+    }();
+    if (!off || hash != 0x33c89263dcb0a389ull) {
+        return;
+    }
+    int changed = 0;
+    for (auto& inst : insts) {
+        for (u32 i = 0; i < inst.src_count && i < inst.src.size(); ++i) {
+            auto& src = inst.src[i];
+            if (src.field == Gcn::OperandField::LiteralConst && src.code == 0x3f333333u) {
+                src.code = 0;
+                ++changed;
+            }
+        }
+    }
+    std::fprintf(stderr, "[exposure] bloom bright pass %#018llx: %d feedback literals (0.7) set to 0\n",
+                 static_cast<unsigned long long>(hash), changed);
+}
+
+} // namespace
 
 IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
     size_t num_syntax_blocks{};
@@ -77,6 +112,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
     }
+    Lbp3BloomFeedbackDiag(program.ins_list, info.pgm_hash);
 
     // Clear any previous pooled data.
     pools.ReleaseContents();

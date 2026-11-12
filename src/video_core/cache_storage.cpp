@@ -14,7 +14,10 @@
 #include <miniz.h>
 
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
+#include <string>
+#include <string_view>
 #include <future>
 #include <mutex>
 #include <queue>
@@ -93,13 +96,19 @@ void DataBase::Open() {
     }
 
     const auto& game_info = Common::ElfInfo::Instance();
+    // LBP3 exposure diagnostics (issues/17-exposure.md): shaders translated with the bloom
+    // feedback removed (LBP3_BLOOM_FEEDBACK=off) get their own cache, so the normal one stays clean.
+    std::string serial{game_info.GameSerial()};
+    if (const char* v = std::getenv("LBP3_BLOOM_FEEDBACK"); v && std::string_view{v} == "off") {
+        serial += "_bloomdiag";
+    }
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 
         cache_path = GetUserPath(PathType::CacheDir) /
-                     std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
+                     std::filesystem::path{serial}.replace_extension(".zip");
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
@@ -110,7 +119,7 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
+        cache_path = GetUserPath(PathType::CacheDir) / serial;
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

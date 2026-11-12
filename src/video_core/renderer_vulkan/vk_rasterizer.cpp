@@ -463,6 +463,36 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (g_lbp3TraceDraws) {
         TraceDraw(pipeline);
     }
+    // LBP3 exposure diagnostics (issues/17-exposure.md): LBP3_COMPOSITE_CB=1 logs the final
+    // composite's (ps 5ed16706) constant buffer, 48 floats, every 30th composite.
+    static const bool log_composite_cb = std::getenv("LBP3_COMPOSITE_CB") != nullptr;
+    if (log_composite_cb) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        static u32 composites = 0;
+        if (ps && ps->pgm_hash == 0x5ed16706fc9e0eb1ull && composites++ % 30 == 0) {
+            for (const auto& desc : ps->buffers) {
+                if (desc.IsSpecial()) {
+                    continue;
+                }
+                const auto sharp = desc.GetSharp(*ps);
+                if (sharp.base_address == 0 || sharp.GetSize() < 192 ||
+                    buffer_cache.IsRegionGpuModified(sharp.base_address, 192)) {
+                    std::fprintf(stderr, "[exposure] composite cb %llx+%x: not readable on the CPU\n",
+                                 (unsigned long long)sharp.base_address, sharp.GetSize());
+                    break;
+                }
+                const auto* f = reinterpret_cast<const float*>(sharp.base_address);
+                std::string line = "[exposure] composite cb";
+                char buf[32];
+                for (u32 i = 0; i < 48; ++i) {
+                    std::snprintf(buf, sizeof(buf), "%s%.4g", i % 4 ? "," : " | ", f[i]);
+                    line += buf;
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+                break;
+            }
+        }
+    }
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
