@@ -335,6 +335,69 @@ u32 g_lbp3TraceIndex = 0;
 void (*g_lbp3AfterDraw)(u32 index) = nullptr;
 void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices) = nullptr;
 void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full) = nullptr;
+int g_lbp3DispatchQueue = -1;
+
+// LBP3 exposure diagnostics (issues/17-exposure.md). The final composite (ps 5ed16706) blends
+// lerp(graded, scene, scene.a), and in the traced frames a masked fill with mask ff000000
+// clears the scene buffer's alpha just before it, so everything is graded (x1.3 + bloom).
+// LBP3_FILL_QUEUE_LOG=1: log, once per destination/mask/value/queue, which queue issued each
+// masked fill (the graphics ring, or a compute queue the game orders with labels).
+// LBP3_ALPHA_FILL=skip: drop the fills that write only the top byte (mask ff000000), to A/B
+// the brightness against PS4 footage. Diagnostic only, not a fix.
+bool Rasterizer::Lbp3ExposureFillDiag(const Shader::Info& cs,
+                                      const AmdGpu::ComputeProgram& program) {
+    static const bool log_queue = std::getenv("LBP3_FILL_QUEUE_LOG") != nullptr;
+    static const bool skip_alpha = [] {
+        const char* v = std::getenv("LBP3_ALPHA_FILL");
+        return v && std::strcmp(v, "skip") == 0;
+    }();
+    if (cs.pgm_hash != kLbp3MaskedFill || (!log_queue && !skip_alpha)) {
+        return false;
+    }
+    // Buffers in binding order: cb, mask, dst (written), value (DetectLbp3Fill).
+    std::array<AmdGpu::Buffer, 4> sharps{};
+    u32 n = 0;
+    for (const auto& desc : cs.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (n == 4) {
+            return false;
+        }
+        sharps[n++] = desc.GetSharp(cs);
+    }
+    if (n != 4) {
+        return false;
+    }
+    const auto& mask = sharps[1];
+    const auto& dst = sharps[2];
+    const auto& value = sharps[3];
+    if (mask.base_address == 0 || mask.GetSize() < 4 || value.base_address == 0 ||
+        value.GetSize() < 4 || buffer_cache.IsRegionGpuModified(mask.base_address, 4) ||
+        buffer_cache.IsRegionGpuModified(value.base_address, 4)) {
+        return false;
+    }
+    const u32 m = *reinterpret_cast<const u32*>(mask.base_address);
+    const u32 v = *reinterpret_cast<const u32*>(value.base_address);
+    const bool skip = skip_alpha && m == 0xff000000u;
+    static std::mutex mutex;
+    static std::set<u64> seen;
+    std::scoped_lock lk{mutex};
+    const u64 key = dst.base_address * 31 + u64(m) * 7 + v +
+                    u64(g_lbp3DispatchQueue + 1) * 1000003ULL + (skip ? 1 : 0);
+    if (seen.insert(key).second) {
+        char queue[32];
+        if (g_lbp3DispatchQueue < 0) {
+            std::snprintf(queue, sizeof(queue), "gfx");
+        } else {
+            std::snprintf(queue, sizeof(queue), "asc vqid %d", g_lbp3DispatchQueue);
+        }
+        std::fprintf(stderr, "[exposure] masked fill %llx mask %08x value %08x %ux%ux%u from %s%s\n",
+                     (unsigned long long)dst.base_address, m, v, program.dim_x, program.dim_y,
+                     program.dim_z, queue, skip ? ": skipped (LBP3_ALPHA_FILL=skip)" : "");
+    }
+    return skip;
+}
 
 void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
@@ -539,6 +602,9 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        return;
+    }
+    if (Lbp3ExposureFillDiag(cs, cs_program)) {
         return;
     }
 

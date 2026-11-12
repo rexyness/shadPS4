@@ -30,6 +30,10 @@ extern void (*g_lbp3AfterDraw)(u32 index);
 // masked fill the rasterizer inspects. Copies only; never set unless the capture is on.
 extern void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices);
 extern void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full);
+// LBP3 exposure diagnostics (issues/17-exposure.md): the queue the command processor is
+// dispatching from, set by Liverpool before each dispatch: -1 = the graphics ring,
+// n >= 0 = compute queue vqid n.
+extern int g_lbp3DispatchQueue;
 
 class GraphicsPipeline;
 class Runtime;
@@ -142,6 +146,9 @@ private:
     // LBP3: the game's render-target fill (perf/reuploads.md).
     void DetectLbp3Fill(const Shader::Info& cs, const AmdGpu::ComputeProgram& program);
     void ApplyLbp3FillClears();
+    // LBP3 exposure diagnostics: logs the queue of each masked fill, and with
+    // LBP3_ALPHA_FILL=skip returns true for the alpha-only fills so they are not dispatched.
+    bool Lbp3ExposureFillDiag(const Shader::Info& cs, const AmdGpu::ComputeProgram& program);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);

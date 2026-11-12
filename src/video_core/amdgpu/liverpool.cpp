@@ -823,6 +823,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
+                Vulkan::g_lbp3DispatchQueue = -1;
                 rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->DispatchDirect(); });
                 break;
@@ -1344,6 +1345,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
+            Vulkan::g_lbp3DispatchQueue = static_cast<int>(vqid);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                     fmt::make_format_args(vqid, cmd_address),
                                     [&] { rasterizer->DispatchDirect(); });
