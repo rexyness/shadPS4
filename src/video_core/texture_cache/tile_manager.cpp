@@ -33,6 +33,9 @@ struct TilingInfo {
     u32 micro_tiled_mips;
     u32 num_mips;
     std::array<MipInfo, MAX_MIPS> mips;
+    // LBP3: the array layer the buffer's first slice is, for detiling a range of layers. The
+    // macro-tiled pipe and bank rotations depend on the absolute slice (tiling.comp).
+    u32 base_slice;
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -194,12 +197,14 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
 }
 
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
-                                                       u64 in_offset, const ImageInfo& info) {
+                                                       u64 in_offset, const ImageInfo& info,
+                                                       u32 base_slice) {
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
     }
 
     TilingInfo params{};
+    params.base_slice = base_slice;
     params.bank_swizzle = info.bank_swizzle;
     params.micro_tiled_mips = info.micro_tiled_mips;
     params.num_mips = info.resources.levels;
