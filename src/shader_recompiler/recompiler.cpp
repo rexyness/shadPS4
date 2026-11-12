@@ -28,13 +28,21 @@ namespace {
 // the 1920x2160 stacked target's texel) get them rescaled. Both axes scale alike (2560/1920 =
 // 1440/1080 = 4/3), so a literal equal to a 1080p size v (1920, 1080 and their halves,
 // quarters and doubles) becomes v * 4/3 and one equal to 1/v becomes 3/4 of it. The list
-// comes from a scan of the translated cache (perf/res1440.md); any other shader with such a
+// comes from a scan of the translated cache (perf/res1440.md) plus a scan of every shader in
+// the game data (perf/res1440_shader_scan.md: the 20 variants of proc_base_outline_special and
+// proc_base_xray_special.gmat, which turn pixel positions into screen UVs with 1/1920 and
+// 1/1080); any other shader with such a
 // literal is logged once, unchanged, so new ones show up in unseen levels.
-constexpr std::array<u64, 17> kLbp3ResShaders = {
-    0x03101c0edb07dfcaull, 0x0b2a33469cd0355aull, 0x2949baf9d0b695fdull, 0x33c89263dcb0a389ull,
-    0x3a0615bd0d8d3a5eull, 0x3d19e6252d1eb891ull, 0x4d3d6de48b31b76aull, 0x5ed16706fc9e0eb1ull,
-    0x8079a39da0f7bae3ull, 0x8e1db4f9563309a5ull, 0x8f2b909cf6507cebull, 0xb0bb8b371aa7cb79ull,
-    0xc9311bbdd52ae955ull, 0xd7506ff3bef3fd6cull, 0xebb656d6240b4b34ull, 0xec6a8d0b0f8c9aedull,
+constexpr std::array<u64, 37> kLbp3ResShaders = {
+    0x01bdeb8c981d9707ull, 0x03101c0edb07dfcaull, 0x0b2a33469cd0355aull, 0x0b6ad5b77f97f53dull,
+    0x28fa0138ced530cfull, 0x2949baf9d0b695fdull, 0x33c89263dcb0a389ull, 0x348dfe0656492033ull,
+    0x3a0615bd0d8d3a5eull, 0x3d19e6252d1eb891ull, 0x45ebb09b18f0cad9ull, 0x48127f9846f6d5bdull,
+    0x4d3d6de48b31b76aull, 0x5ed16706fc9e0eb1ull, 0x6fb557919f13d7ddull, 0x8079a39da0f7bae3ull,
+    0x81806190305e4920ull, 0x84d76a355aa6d207ull, 0x8a7941e68761e0b8ull, 0x8e1db4f9563309a5ull,
+    0x8f2b909cf6507cebull, 0x99c9d482d4b1ae47ull, 0xafa557bb8761e0b8ull, 0xb0bb8b371aa7cb79ull,
+    0xc0b6e8311f62243full, 0xc4840ca6ae16ca10ull, 0xc9311bbdd52ae955ull, 0xcb7aeb628c7e0259ull,
+    0xd4973da9b6e3f34bull, 0xd7506ff3bef3fd6cull, 0xe22754605aa6d207ull, 0xe8a99293f879f3d7ull,
+    0xebb656d6240b4b34ull, 0xec6a8d0b0f8c9aedull, 0xeeb805869a0cb137ull, 0xfc0d6d669f13d7ddull,
     0xfdf2b5d50f5db65dull,
 };
 
