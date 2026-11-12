@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <string_view>
+#include <tuple>
 
 #include <boost/preprocessor/stringize.hpp>
 
@@ -339,8 +343,17 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           bool top_level) {
     FIBER_ENTER(dcb_task_name);
+
+    // LBP3 Recompiled (perf/early_flip.md): where this buffer starts and ends, so the PatchedFlip
+    // case can tell the runtime's marker (always the NOP 59 dwords before a top-level buffer's
+    // end) from a stale copy of it left in reused command memory.
+    const u32* const lbp3_dcb_begin = dcb.data();
+    const u32* const lbp3_dcb_end = dcb.data() + dcb.size();
+    const u32 lbp3_buffer_index =
+        top_level ? lbp3_gfx_buffers_since_flip++ : lbp3_gfx_buffers_since_flip - 1;
 
     cblock.Reset();
 
@@ -454,7 +467,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    //
+                    // LBP3 Recompiled (perf/early_flip.md): the runtime patches the flip
+                    // request into the NOP 59 dwords before the end of the frame's last
+                    // top-level buffer (runtime videoout.cpp PatchFlipRequest; upstream's
+                    // gnmdriver.cpp writes it at the same place) and never removes it. The
+                    // game later reuses that memory for other command buffers, and a NOP that
+                    // lands on the old header with its first body dword left unwritten carries
+                    // the old marker: at the Pod's first frame that flipped after buffer 1 of 8.
+                    // Only the marker at that exact position of a top-level buffer is a flip;
+                    // keep this rule and PatchFlipRequest's layout in step.
+                    const u32* const nop_at = reinterpret_cast<const u32*>(header);
+                    if (top_level && nop_at + 59 == lbp3_dcb_end) {
+                        lbp3_gfx_buffers_since_flip = 0;
+                        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    } else {
+                        // Once per position (dword offset, buffer size, NOP size), at most 32
+                        // lines: the parsed buffer is the runtime's snapshot copy, so the same
+                        // stale marker shows up at a different address each time.
+                        static std::mutex logged_mutex;
+                        static std::set<std::tuple<size_t, size_t, u32, bool>> logged;
+                        const size_t offset = static_cast<size_t>(nop_at - lbp3_dcb_begin);
+                        const size_t size = static_cast<size_t>(lbp3_dcb_end - lbp3_dcb_begin);
+                        std::scoped_lock lk{logged_mutex};
+                        if (logged.size() < 32 &&
+                            logged.emplace(offset, size, count, top_level).second) {
+                            std::fprintf(stderr,
+                                         "[gnm] ignored a stale flip marker at 0x%llx: dword %zu of "
+                                         "%s buffer %u (size %zu dwords), NOP of %u body dwords\n",
+                                         static_cast<unsigned long long>(
+                                             reinterpret_cast<uintptr_t>(nop_at)),
+                                         offset, top_level ? "top-level" : "an indirect",
+                                         lbp3_buffer_index, size, count);
+                        }
+                    }
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -1027,7 +1073,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {},
+                    false);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {

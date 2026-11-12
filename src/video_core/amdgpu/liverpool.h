@@ -261,7 +261,9 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    // top_level: false for an indirect buffer (LBP3 Recompiled: only a top-level buffer's own
+    // patched flip NOP is a flip; see the PatchedFlip case).
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, bool top_level = true);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
@@ -344,6 +346,10 @@ public:
     std::atomic<u32> lbp3_gfx_blocked_waits{};
     std::atomic<s64> lbp3_gfx_blocked_since_ns{};
     std::atomic<u32> learned_waits{};   // wait addresses added to guest_written_waits
+    // LBP3 Recompiled (perf/early_flip.md): top-level graphics buffers started since the last
+    // accepted flip, for naming the buffer a stale flip marker was found in (command-processor
+    // thread only).
+    u32 lbp3_gfx_buffers_since_flip = 0;
 
 private:
     std::mutex submit_mutex;
