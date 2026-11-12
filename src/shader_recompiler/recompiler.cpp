@@ -12,7 +12,79 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace Shader {
+
+namespace {
+
+// LBP3 (exp/res1440): with LBP3_RES=1440 and LBP3_RES_SHADERS=1, the shaders that carry the
+// game's 1080p render size as literals (SMAA's RT_METRICS, the composite's 1/480 bloom step,
+// the 1920x2160 stacked target's texel) get them rescaled. Both axes scale alike (2560/1920 =
+// 1440/1080 = 4/3), so a literal equal to a 1080p size v (1920, 1080 and their halves,
+// quarters and doubles) becomes v * 4/3 and one equal to 1/v becomes 3/4 of it. The list
+// comes from a scan of the translated cache (perf/res1440.md); any other shader with such a
+// literal is logged once, unchanged, so new ones show up in unseen levels.
+constexpr std::array<u64, 17> kLbp3ResShaders = {
+    0x03101c0edb07dfcaull, 0x0b2a33469cd0355aull, 0x2949baf9d0b695fdull, 0x33c89263dcb0a389ull,
+    0x3a0615bd0d8d3a5eull, 0x3d19e6252d1eb891ull, 0x4d3d6de48b31b76aull, 0x5ed16706fc9e0eb1ull,
+    0x8079a39da0f7bae3ull, 0x8e1db4f9563309a5ull, 0x8f2b909cf6507cebull, 0xb0bb8b371aa7cb79ull,
+    0xc9311bbdd52ae955ull, 0xd7506ff3bef3fd6cull, 0xebb656d6240b4b34ull, 0xec6a8d0b0f8c9aedull,
+    0xfdf2b5d50f5db65dull,
+};
+
+bool Lbp3ResShadersOn() {
+    static const bool on = [] {
+        const char* res = std::getenv("LBP3_RES");
+        const char* sh = std::getenv("LBP3_RES_SHADERS");
+        return res && std::strcmp(res, "1440") == 0 && sh && std::strcmp(sh, "1") == 0;
+    }();
+    return on;
+}
+
+// 0 = not a 1080p size; otherwise the factor to apply (4/3 for a size, 3/4 for a reciprocal).
+float Lbp3ResFactor(float f) {
+    static constexpr float kSizes[] = {1920.f, 1080.f, 960.f, 540.f, 480.f, 270.f, 3840.f, 2160.f, 7680.f, 4320.f};
+    if (!std::isfinite(f) || f <= 0.f) return 0.f;
+    for (const float v : kSizes) {
+        if (std::fabs(f - v) <= v * 2e-6f) return 4.f / 3.f;
+        if (std::fabs(f - 1.f / v) <= (1.f / v) * 2e-6f) return 3.f / 4.f;
+    }
+    return 0.f;
+}
+
+void Lbp3ScaleResolutionLiterals(std::vector<Gcn::GcnInst>& insts, u64 hash) {
+    if (!Lbp3ResShadersOn()) return;
+    bool listed = false;
+    for (const u64 h : kLbp3ResShaders) listed |= h == hash;
+    int changed = 0, seen = 0;
+    for (auto& inst : insts) {
+        for (u32 i = 0; i < inst.src_count && i < inst.src.size(); ++i) {
+            auto& src = inst.src[i];
+            if (src.field != Gcn::OperandField::LiteralConst) continue;
+            const float f = std::bit_cast<float>(src.code);
+            const float k = Lbp3ResFactor(f);
+            if (k == 0.f) continue;
+            ++seen;
+            if (!listed) continue;
+            src.code = std::bit_cast<u32>(f * k);
+            ++changed;
+        }
+    }
+    if (listed)
+        std::fprintf(stderr, "[res] shader %#018llx: %d 1080p literals scaled for 1440p\n",
+                     static_cast<unsigned long long>(hash), changed);
+    else if (seen)
+        std::fprintf(stderr, "[res] shader %#018llx: %d 1080p-like literals, NOT on the list (unchanged)\n",
+                     static_cast<unsigned long long>(hash), seen);
+}
+
+} // namespace
 
 IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
     size_t num_syntax_blocks{};
@@ -77,6 +149,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
     }
+    Lbp3ScaleResolutionLiterals(program.ins_list, info.pgm_hash);
 
     // Clear any previous pooled data.
     pools.ReleaseContents();
