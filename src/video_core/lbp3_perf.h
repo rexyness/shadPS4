@@ -50,6 +50,7 @@ enum Kind : int {
     ImgFree,      // UniqueImage destroy (vmaDestroyImage): count, us
     VmaFree,      // VMA's vkFreeMemory calls (device memory callback): count, bytes
     GpuImgCopy,   // GPU: image-to-image copies (Runtime::CopyImage, e.g. ExpandImage)
+    Memcpy,       // guest memory -> staging copies (CopySparseMemory) in buffer and image uploads
     kKinds
 };
 

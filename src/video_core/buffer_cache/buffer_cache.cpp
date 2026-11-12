@@ -194,7 +194,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
-    memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    {
+        Lbp3Perf::Scope lbp3_copy(Lbp3Perf::Memcpy);  // LBP3: milestone 5 measurement
+        lbp3_copy.bytes = staging.size;
+        memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    }
     staging.Flush();
     return {staging.buffer, staging.offset};
 }
@@ -348,6 +352,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         lbp3_scope.bytes = total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
+            Lbp3Perf::Scope lbp3_copy(Lbp3Perf::Memcpy);  // LBP3: milestone 5 measurement
+            lbp3_copy.bytes = copy.size;
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
