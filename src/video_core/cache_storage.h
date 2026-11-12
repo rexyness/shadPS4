@@ -41,6 +41,12 @@ public:
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
+    // LBP3 Recompiled: where the driver's VkPipelineCache is saved, beside the shader cache
+    // (<serial>\driver.vkcache, or <serial>.vkcache next to an archived cache). Ported from
+    // LBPPC (emurphy04), GPL-2.0-or-later, commit aad6a91 (DataBase::DriverCachePath). Only
+    // meaningful once Open() has run.
+    [[nodiscard]] std::filesystem::path DriverCachePath() const;
+
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};

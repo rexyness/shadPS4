@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <thread>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -137,6 +144,24 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
+// LBP3 Recompiled: a cached pipeline read at boot, built later on one of several threads.
+// Ported from LBPPC (emurphy04), GPL-2.0-or-later, commit aad6a91
+// (vk_pipeline_serialization.cpp: PipelineCache::PreloadJob). Our fetch shader is a pointer into
+// a Program's permutation list, which later reads may grow (and move), so the job keeps a copy.
+struct PipelineCache::PreloadJob {
+    bool compute{};
+    ComputePipelineKey compute_key{};
+    GraphicsPipelineKey graphics_key{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    GraphicsPipeline::SerializationSupport graphics_sdata{};
+    ComputePipeline::SerializationSupport compute_sdata{};
+    std::unique_ptr<GraphicsPipeline> graphics;
+    std::unique_ptr<ComputePipeline> compute_pipeline;
+};
+
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     compute_key.Deserialize(ar);
 
@@ -158,6 +183,19 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
+
+    if (preload_jobs) {
+        // LBP3 Recompiled: built later by BuildPreloaded (ported from LBPPC, see PreloadJob).
+        auto& job = preload_jobs->emplace_back();
+        job.compute = true;
+        job.compute_key = compute_key;
+        job.infos = infos;
+        job.modules = modules;
+        job.compute_sdata = sdata;
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return true;
+    }
 
     it.value() =
         std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
@@ -233,6 +271,23 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
+
+    if (preload_jobs) {
+        // LBP3 Recompiled: built later by BuildPreloaded (ported from LBPPC, see PreloadJob).
+        auto& job = preload_jobs->emplace_back();
+        job.graphics_key = graphics_key;
+        job.infos = infos;
+        job.runtime_infos = runtime_infos;
+        job.modules = modules;
+        if (fetch_shader) {
+            job.fetch_shader = *fetch_shader;
+        }
+        job.graphics_sdata = sdata;
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
 
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
@@ -340,6 +395,18 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
+    // LBP3 Recompiled: the stages are read here, one after the other; the pipelines are then
+    // built on several threads (BuildPreloaded), where the driver spends nearly all of the
+    // preload's time. Ported from LBPPC (emurphy04), GPL-2.0-or-later, commit aad6a91
+    // (PipelineCache::WarmUp). LBP3_PIPELINE_THREADS=1 is the old serial preload.
+    u32 threads = std::clamp(std::thread::hardware_concurrency(), 2u, 17u) - 1;
+    if (const char* env = std::getenv("LBP3_PIPELINE_THREADS"); env && *env) {
+        threads = std::clamp<u32>(u32(std::strtoul(env, nullptr, 10)), 1u, 64u);
+    }
+    const auto preload_start = std::chrono::steady_clock::now();
+    std::vector<PreloadJob> jobs;
+    preload_jobs = threads > 1 ? &jobs : nullptr;
+
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
@@ -368,6 +435,15 @@ void PipelineCache::WarmUp() {
             }
         });
 
+    preload_jobs = nullptr;
+    BuildPreloaded(jobs, threads);
+    std::fprintf(stderr, "[gpu] pipeline preload: %u of %u cached pipelines in %.2f s on %u thread%s\n",
+                 num_pipelines, num_total_pipelines,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_start)
+                     .count(),
+                 threads > 1 ? std::min<u32>(threads, u32(std::max<size_t>(jobs.size(), 1))) : 1u,
+                 threads > 1 && jobs.size() > 1 ? "s" : "");
+
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
@@ -375,6 +451,53 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().FinishPreload();
+}
+
+// LBP3 Recompiled: builds the preload's pipelines on `threads` threads (the calling one
+// included), then files them in the maps. Ported from LBPPC (emurphy04), GPL-2.0-or-later,
+// commit aad6a91 (PipelineCache::BuildPreloaded). Thread safety: the builds only call into the
+// device (vkCreate*; the VkPipelineCache is synchronized by the driver) and read the job's own
+// data and the Programs' Info, which no other thread touches during WarmUp. WarmUp runs in the
+// PipelineCache constructor, before the rasterizer draws anything, and the maps are only
+// written here, after every thread has joined. A pipeline the driver refuses asserts as it did
+// in the serial preload.
+void PipelineCache::BuildPreloaded(std::vector<PreloadJob>& jobs, u32 threads) {
+    if (jobs.empty()) {
+        return;
+    }
+    threads = std::min<u32>(threads, u32(jobs.size()));
+    std::atomic<size_t> next{0};
+    const auto build = [&] {
+        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
+            auto& job = jobs[i];
+            if (job.compute) {
+                job.compute_pipeline = std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile, *pipeline_cache, job.compute_key,
+                    *job.infos[0], job.modules[0], job.compute_sdata, true);
+            } else {
+                job.graphics = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, job.graphics_key, *pipeline_cache,
+                    job.infos, job.runtime_infos,
+                    job.fetch_shader ? &*job.fetch_shader : nullptr, job.modules,
+                    job.graphics_sdata, true);
+            }
+        }
+    };
+    {
+        std::vector<std::jthread> pool;
+        pool.reserve(threads > 0 ? threads - 1 : 0);
+        for (u32 t = 1; t < threads; ++t) {
+            pool.emplace_back(build);
+        }
+        build();
+    } // joins the pool
+    for (auto& job : jobs) {
+        if (job.compute) {
+            compute_pipelines[job.compute_key] = std::move(job.compute_pipeline);
+        } else {
+            graphics_pipelines[job.graphics_key] = std::move(job.graphics);
+        }
+    }
 }
 
 void PipelineCache::Sync() {

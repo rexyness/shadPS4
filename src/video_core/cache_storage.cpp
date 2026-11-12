@@ -131,6 +131,15 @@ void DataBase::Open() {
     opened = true;
 }
 
+std::filesystem::path DataBase::DriverCachePath() const {
+    // Ported from LBPPC (emurphy04), GPL-2.0-or-later, commit aad6a91. The extension matches no
+    // blob type, so ForEachBlob never reads the file.
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        return std::filesystem::path{cache_path}.replace_extension(".vkcache");
+    }
+    return cache_path / "driver.vkcache";
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
         return;

@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <ranges>
 #include <set>
@@ -13,6 +15,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -22,6 +25,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_driver_cache_file.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -46,6 +50,29 @@ u64 Lbp3UsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<u64>(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
 }
+
+// LBP3 Recompiled: LBP3_VK_PIPELINE_CACHE=off keeps the old driver cache (in memory only, made
+// after the preload, so the preload built every pipeline without one).
+bool Lbp3DriverCacheOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("LBP3_VK_PIPELINE_CACHE");
+        return !(env && std::strcmp(env, "off") == 0);
+    }();
+    return on;
+}
+
+DriverCacheFile::Identity Lbp3DriverIdentity(const Instance& instance) {
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    DriverCacheFile::Identity id{};
+    id.vendor_id = props.vendorID;
+    id.device_id = props.deviceID;
+    id.driver_version = props.driverVersion;
+    std::memcpy(id.uuid.data(), props.pipelineCacheUUID.data(), DriverCacheFile::kUuidSize);
+    return id;
+}
+
+// The live cache, for SaveDriverPipelineCacheNow (the runtime's exit paths).
+std::atomic<PipelineCache*> g_lbp3_live_cache{};
 } // namespace
 
 using Shader::HwStage;
@@ -369,15 +396,160 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                  instance.GetMaxGeometryTotalOutputComponents(),
                  instance.GetMaxGeometryInputComponents(),
                  instance.IsGeometryStageSupported() ? "supported" : "not supported");
-    WarmUp();
+    if (Lbp3DriverCacheOn()) {
+        // LBP3 Recompiled: the driver cache is made (and loaded from disk) before WarmUp, so the
+        // preload builds its pipelines through it; it used to be made after the preload, which
+        // so built every cached pipeline without one. Ported from LBPPC (emurphy04),
+        // GPL-2.0-or-later, commit aad6a91 (the PipelineCache constructor's "bbport:" change).
+        if (EmulatorSettings.IsPipelineCacheEnabled()) {
+            Storage::DataBase::Instance().Open();
+        }
+        const bool loaded = CreateDriverCache();
+        WarmUp();
+        // A new or rejected driver cache got every preloaded pipeline: worth saving once.
+        if (!loaded && !driver_cache_file.empty()) {
+            driver_cache_changes += u32(graphics_pipelines.size() + compute_pipelines.size());
+        }
+    } else {
+        WarmUp();
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+        auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+        ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+                   vk::to_string(cache_result));
+        pipeline_cache = std::move(cache);
+        std::fprintf(stderr,
+                     "[gpu] driver pipeline cache: in memory only (LBP3_VK_PIPELINE_CACHE=off)\n");
+    }
+    g_lbp3_live_cache.store(this);
+}
+
+PipelineCache::~PipelineCache() {
+    PipelineCache* self = this;
+    g_lbp3_live_cache.compare_exchange_strong(self, nullptr);
+    driver_cache_saver = {}; // request_stop() and join()
+    SaveDriverCache();
+}
+
+// LBP3 Recompiled: the driver's VkPipelineCache on disk. Ported from LBPPC (emurphy04),
+// GPL-2.0-or-later, commit aad6a91 (PipelineCache::CreateDriverCache/SaveDriverCache), with our
+// own file header (vk_driver_cache_file.h: magic, size, and the driver version as well as the
+// GPU and pipelineCacheUUID). Returns true when a saved cache was loaded.
+bool PipelineCache::CreateDriverCache() {
+    const auto id = Lbp3DriverIdentity(instance);
+    std::vector<u8> file_bytes;
+    auto& storage = Storage::DataBase::Instance();
+    if (storage.IsOpened()) {
+        driver_cache_file = storage.DriverCachePath();
+        std::ifstream file{driver_cache_file, std::ios::binary | std::ios::ate};
+        if (file) {
+            file_bytes.resize(static_cast<size_t>(file.tellg()));
+            file.seekg(0);
+            if (!file.read(reinterpret_cast<char*>(file_bytes.data()),
+                           std::streamsize(file_bytes.size()))) {
+                file_bytes.clear();
+            }
+        }
+    }
+
+    std::string why;
+    std::vector<u8> data = DriverCacheFile::Unwrap(id, file_bytes, &why);
+    if (!why.empty()) {
+        std::fprintf(stderr,
+                     "[gpu] driver pipeline cache: the saved one was %s; starting a new one\n",
+                     why.c_str());
+    }
+
+    const auto device = instance.GetDevice();
+    auto [cache_result, cache] = device.createPipelineCacheUnique({
+        .initialDataSize = data.size(),
+        .pInitialData = data.data(),
+    });
+    if (cache_result != vk::Result::eSuccess && !data.empty()) {
+        std::fprintf(stderr,
+                     "[gpu] driver pipeline cache: the driver refused the saved one (%s); starting "
+                     "a new one\n",
+                     vk::to_string(cache_result).c_str());
+        data.clear();
+        auto retry = device.createPipelineCacheUnique({});
+        cache_result = retry.result;
+        cache = std::move(retry.value);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    if (driver_cache_file.empty()) {
+        std::fprintf(stderr, "[gpu] driver pipeline cache: in memory only (no shader cache)\n");
+        return false;
+    }
+    std::fprintf(stderr, "[gpu] driver pipeline cache: %s (%zu KiB) %s\n",
+                 data.empty() ? "new" : "loaded", data.size() >> 10,
+                 driver_cache_file.string().c_str());
+
+    // Saved while the game runs, every 20 seconds when pipelines were made since: the game is
+    // usually ended (ExitProcess), not shut down.
+    driver_cache_saver = std::jthread{[this](std::stop_token token) {
+        Common::SetCurrentThreadName("lbp3:DriverPipelineCache");
+        u32 seconds = 0;
+        while (!token.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (++seconds >= 20 && driver_cache_changes.load(std::memory_order_relaxed) != 0) {
+                seconds = 0;
+                SaveDriverCache();
+            }
+        }
+    }};
+    return !data.empty();
 }
 
-PipelineCache::~PipelineCache() = default;
+void PipelineCache::SaveDriverCache() {
+    if (driver_cache_file.empty() || !pipeline_cache) {
+        return;
+    }
+    std::scoped_lock lock{driver_cache_mutex};
+    const u32 changes = driver_cache_changes.exchange(0);
+    if (changes == 0) {
+        return;
+    }
+    // The driver synchronizes the cache: this may run while the GPU thread makes pipelines.
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty()) {
+        std::fprintf(stderr, "[gpu] driver pipeline cache: could not read it (%s)\n",
+                     vk::to_string(result).c_str());
+        driver_cache_changes += changes;
+        return;
+    }
+    const auto bytes = DriverCacheFile::Wrap(Lbp3DriverIdentity(instance), data);
+    // Written beside and then renamed: a game ended while writing keeps the previous file.
+    auto temp = driver_cache_file;
+    temp += ".new";
+    {
+        std::ofstream file{temp, std::ios::binary | std::ios::trunc};
+        file.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!file) {
+            std::fprintf(stderr, "[gpu] driver pipeline cache: could not write %s\n",
+                         temp.string().c_str());
+            driver_cache_changes += changes;
+            return;
+        }
+    }
+    std::error_code error;
+    std::filesystem::rename(temp, driver_cache_file, error);
+    if (error) {
+        std::fprintf(stderr, "[gpu] driver pipeline cache: could not save it (%s)\n",
+                     error.message().c_str());
+        std::filesystem::remove(temp, error);
+        driver_cache_changes += changes;
+        return;
+    }
+    std::fprintf(stderr, "[gpu] driver pipeline cache: saved (%zu KiB, %u new pipelines)\n",
+                 data.size() >> 10, changes);
+}
+
+void SaveDriverPipelineCacheNow() {
+    if (PipelineCache* cache = g_lbp3_live_cache.load()) {
+        cache->SaveDriverCache();
+    }
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -459,6 +631,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
+        ++driver_cache_changes; // LBP3 Recompiled: the driver cache has something new to save
         ++g_lbp3PipelineCompiles;
         g_lbp3PipelineCompileUs += Lbp3UsSince(lbp3_start);
 
@@ -490,6 +663,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+        ++driver_cache_changes; // LBP3 Recompiled: the driver cache has something new to save
         ++g_lbp3PipelineCompiles;
         g_lbp3PipelineCompileUs += Lbp3UsSince(lbp3_start);
 

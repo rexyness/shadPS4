@@ -3,9 +3,14 @@
 
 #pragma once
 
+#include <atomic>
+#include <filesystem>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -80,6 +85,11 @@ public:
     void WarmUp();
     void Sync();
 
+    // LBP3 Recompiled: writes the driver's VkPipelineCache to its file now (the runtime calls it
+    // through SaveDriverPipelineCacheNow when the game exits; it ends with ExitProcess, so no
+    // destructor runs). Ported from LBPPC (emurphy04), GPL-2.0-or-later, commit aad6a91.
+    void SaveDriverCache();
+
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
@@ -141,6 +151,19 @@ private:
         return num_new_pipelines > 0;
     }
 
+    // LBP3 Recompiled: the driver's VkPipelineCache, loaded from and saved to disk
+    // (LBP3_VK_PIPELINE_CACHE=off: the old in-memory cache made after WarmUp). Ported from LBPPC
+    // (emurphy04), GPL-2.0-or-later, commit aad6a91 (CreateDriverCache).
+    bool CreateDriverCache(); ///< true when a saved cache was loaded
+
+    // LBP3 Recompiled: the boot preload reads the cached stages one after the other, then builds
+    // the pipelines on several threads (LBP3_PIPELINE_THREADS, default cores - 1, at most 16;
+    // 1 = the old serial preload). Ported from LBPPC (emurphy04), GPL-2.0-or-later, commit
+    // aad6a91 (PreloadJob, BuildPreloaded).
+    struct PreloadJob;
+    std::vector<PreloadJob>* preload_jobs{};
+    void BuildPreloaded(std::vector<PreloadJob>& jobs, u32 threads);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -169,6 +192,17 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // LBP3 Recompiled: the driver cache's file and its saver (ported from LBPPC, see above).
+    // Declared last: the saver thread is stopped and joined before pipeline_cache is destroyed.
+    std::filesystem::path driver_cache_file;
+    std::atomic<u32> driver_cache_changes{}; ///< pipelines made since the last save
+    std::mutex driver_cache_mutex;
+    std::jthread driver_cache_saver;
 };
+
+// LBP3 Recompiled: saves the live PipelineCache's driver cache, if there is one with unsaved
+// pipelines. Safe to call from any thread, at any time (the game's exit paths).
+void SaveDriverPipelineCacheNow();
 
 } // namespace Vulkan
