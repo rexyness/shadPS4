@@ -456,6 +456,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            // LBP3 exposure diagnostics (issues/17-exposure.md): in a traced frame, the sync
+            // packets between the draws (cache flushes, CS partial flushes, waits), in order.
+            if (Vulkan::g_lbp3TraceDraws.load(std::memory_order_relaxed) &&
+                (opcode == PM4ItOpcode::EventWrite || opcode == PM4ItOpcode::EventWriteEop ||
+                 opcode == PM4ItOpcode::EventWriteEos || opcode == PM4ItOpcode::AcquireMem ||
+                 opcode == PM4ItOpcode::SurfaceSync || opcode == PM4ItOpcode::WaitRegMem)) {
+                const u32* w = reinterpret_cast<const u32*>(header);
+                std::fprintf(stderr, "[pm4] gfx %s %08x %08x %08x\n",
+                             std::string(magic_enum::enum_name(opcode)).c_str(),
+                             count > 0 ? w[1] : 0u, count > 1 ? w[2] : 0u, count > 2 ? w[3] : 0u);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);

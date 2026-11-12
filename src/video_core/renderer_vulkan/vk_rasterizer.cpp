@@ -419,8 +419,12 @@ void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
         }
         u32 blend;
         std::memcpy(&blend, &regs.blend_control[i], 4);
-        std::snprintf(buf, sizeof(buf), " rt%u=%llx(blend %08x)", i, (unsigned long long)cb.Address(),
-                      blend);
+        // LBP3 exposure diagnostics: the colour write masks (CB_TARGET_MASK / CB_SHADER_MASK),
+        // the pixel shader's export format (SPI_SHADER_COL_FORMAT) and CB_COLORi_INFO.
+        std::snprintf(buf, sizeof(buf), " rt%u=%llx(blend %08x mask %x/%x exp %u info %08x)", i,
+                      (unsigned long long)cb.Address(), blend, regs.color_target_mask.GetMask(i),
+                      regs.color_shader_mask.GetMask(i),
+                      static_cast<u32>(regs.color_export_format.GetFormat(i)), cb.info.raw);
         line += buf;
     }
     const auto& db = regs.depth_buffer;
