@@ -266,6 +266,9 @@ void Rasterizer::DetectLbp3Fill(const Shader::Info& cs, const AmdGpu::ComputePro
     const bool full = index_mask == 0 && m == 0xffffffffu && count != 0 && dst.stride == 4 &&
                       dst.num_records >= count && u64(count) * 4 <= dst_size && one_dim &&
                       threads >= count;
+    if (g_lbp3FgOnFill) {
+        g_lbp3FgOnFill(dst.base_address, u64(count) * 4, v, m, full);
+    }
     if (!full) {
         if (VideoCore::Lbp3FillLog()) {
             static std::mutex mutex;
@@ -330,6 +333,8 @@ void Rasterizer::ApplyLbp3FillClears() {
 // and an optional callback run right after each traced draw executes.
 u32 g_lbp3TraceIndex = 0;
 void (*g_lbp3AfterDraw)(u32 index) = nullptr;
+void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices) = nullptr;
+void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full) = nullptr;
 
 void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
@@ -427,6 +432,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
     if (g_lbp3TraceDraws && g_lbp3AfterDraw) {
         g_lbp3AfterDraw(g_lbp3TraceIndex);
+    }
+    if (g_lbp3FgAfterDraw) {
+        const auto stage_hash = [&](Shader::SwStage st) -> u64 {
+            const auto* info = pipeline->GetStages()[u32(st)];
+            return info ? info->pgm_hash : 0;
+        };
+        g_lbp3FgAfterDraw(stage_hash(Shader::SwStage::Vertex),
+                          stage_hash(Shader::SwStage::Fragment), regs.num_indices);
     }
 
     ResetBindings(false);

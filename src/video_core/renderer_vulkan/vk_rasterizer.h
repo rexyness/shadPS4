@@ -26,6 +26,10 @@ namespace Vulkan {
 extern std::atomic<bool> g_lbp3TraceDraws;
 extern u32 g_lbp3TraceIndex;
 extern void (*g_lbp3AfterDraw)(u32 index);
+// LBP3 frame-generation capture (LBP3_FG_DUMP): run after every executed draw, and for every
+// masked fill the rasterizer inspects. Copies only; never set unless the capture is on.
+extern void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices);
+extern void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full);
 
 class GraphicsPipeline;
 class Runtime;
