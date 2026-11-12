@@ -30,13 +30,12 @@ namespace {
 // 1440/1080 = 4/3), so a literal equal to a 1080p size v (1920, 1080 and their halves,
 // quarters and doubles) becomes v * 4/3 and one equal to 1/v becomes 3/4 of it. The list
 // (Lbp3Res::kShaders, common/lbp3_res.h, the one list for the rescale and the cache salt) comes
-// from a scan of the translated cache (perf/res1440.md) plus a scan of every shader in the game
-// data (perf/res1440_shader_scan.md): the 20 variants of proc_base_outline_special and
-// proc_base_xray_special.gmat (pixel positions to screen UVs with 1/1920 and 1/1080), six more
-// final-composite variants (finalcomp_lowres and five unnamed ones, the 1/480 bloom step) and
-// tgpshaderblur (1/960, 1/540). Any other shader with such a literal is logged once, unchanged,
-// so new ones show up in unseen levels. With the shared cache the listed shaders arrive here
-// under their salted hash (GetParams), so they are matched in either form.
+// from a scan of the translated cache (perf/res1440.md). A scan of every shader in the game data
+// (perf/res1440_shader_scan.md) found 27 more (the outline and x-ray material variants, more
+// final-composite variants, tgpshaderblur); they're held on branch fix/res1440-shaders-44 until
+// seen in game. Any other shader with such a literal is logged once, unchanged, so new ones show
+// up in unseen levels. With the shared cache the listed shaders arrive here under their salted
+// hash (GetParams), so they are matched in either form.
 bool Lbp3ResShadersOn() {
     return Lbp3Res::ShadersOn();
 }
