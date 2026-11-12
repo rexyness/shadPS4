@@ -89,12 +89,14 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 
 UniqueImage::~UniqueImage() {
     if (image) {
+        Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ImgFree);  // LBP3: milestone 5 measurement
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
+        Lbp3Perf::Scope lbp3_scope(Lbp3Perf::ImgFree);  // LBP3: milestone 5 measurement
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};

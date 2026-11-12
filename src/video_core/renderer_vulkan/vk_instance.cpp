@@ -639,6 +639,9 @@ static void VKAPI_PTR Lbp3VmaAllocate(VmaAllocator, uint32_t, VkDeviceMemory, Vk
                                       void*) {
     Lbp3Perf::NoteVmaAllocate(size);
 }
+static void VKAPI_PTR Lbp3VmaFree(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size, void*) {
+    Lbp3Perf::NoteVmaFree(size);
+}
 
 void Instance::CreateAllocator() {
     const VmaVulkanFunctions functions = {
@@ -647,7 +650,7 @@ void Instance::CreateAllocator() {
     };
     static const VmaDeviceMemoryCallbacks lbp3_memory_callbacks = {
         .pfnAllocate = Lbp3VmaAllocate,
-        .pfnFree = nullptr,
+        .pfnFree = Lbp3VmaFree,
         .pUserData = nullptr,
     };
 

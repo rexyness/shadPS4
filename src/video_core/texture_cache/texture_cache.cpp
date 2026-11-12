@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <limits>
 #include <xxhash.h>
 
@@ -285,11 +286,16 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     return cache_image_id;
 }
 
+// LBP3: milestone 5 measurement (LBP3_FIRST_FRAME): what asked for an expansion.
+static int g_lbp3ExpandBinding = -1;
+static int g_lbp3ExpandSite = 0;
+
 std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& image_info,
                                                            BindingType binding,
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
     static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
+    g_lbp3ExpandBinding = static_cast<int>(binding);  // LBP3: milestone 5 measurement
 
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
@@ -314,7 +320,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+            return {(g_lbp3ExpandSite = 1, ExpandImage(image_info, cache_image_id)), -1, -1};
         }
 
         if (image_info.guest_size == cache_image.info.guest_size &&
@@ -329,7 +335,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (slices_of_volume) {
                 return {cache_image_id, -1, -1};
             }
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+            return {(g_lbp3ExpandSite = 2, ExpandImage(image_info, cache_image_id)), -1, -1};
         }
 
         const bool pow2_padding_only =
@@ -353,7 +359,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
             image_info.resources > cache_image.info.resources) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+            return {(g_lbp3ExpandSite = 3, ExpandImage(image_info, cache_image_id)), -1, -1};
         }
 
         // Size is greater but resources are not, because the tiling mode is different.
@@ -541,14 +547,33 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
                 DescribeInfo(info));
     ++g_lbp3ImageExpands;
     Lbp3Perf::Scope lbp3_scope(Lbp3Perf::Expand);  // LBP3: milestone 5 measurement
+    // LBP3: milestone 5 measurement. LBP3_FIRST_FRAME=1 prints every expansion (the warning
+    // above stops after 20) with where its time went.
+    const bool lbp3_log = Lbp3Perf::g_gpuOn;
+    u32 lbp3_old_layers = 0, lbp3_old_levels = 0, lbp3_old_flags = 0;
+    u64 lbp3_old_size = 0;
+    bool lbp3_old_target = false, lbp3_gpu_modified = false;
+    if (lbp3_log) {
+        const Image& old = slot_images[image_id];
+        lbp3_old_layers = old.info.resources.layers;
+        lbp3_old_levels = old.info.resources.levels;
+        lbp3_old_size = old.info.guest_size;
+        lbp3_old_flags = static_cast<u32>(old.flags);
+        lbp3_old_target = old.binding.is_target;
+        lbp3_gpu_modified = buffer_cache.IsRegionGpuModified(info.guest_address, info.guest_size);
+    }
+    const u64 lbp3_t0 = lbp3_log ? Lbp3Perf::NowUs() : 0;
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
+    const u64 lbp3_t1 = lbp3_log ? Lbp3Perf::NowUs() : 0;
 
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
     RefreshImage(new_image);
+    const u64 lbp3_t2 = lbp3_log ? Lbp3Perf::NowUs() : 0;
     runtime.CopyImage(&src_image, &new_image);
+    const u64 lbp3_t3 = lbp3_log ? Lbp3Perf::NowUs() : 0;
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -556,6 +581,24 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     FreeImage(image_id);
     TrackImage(new_image_id);
+    if (lbp3_log) {
+        const u64 lbp3_t4 = Lbp3Perf::NowUs();
+        std::fprintf(stderr,
+                     "[first-frame] expand %#llx %ux%ux%u %s type %u layers %u->%u mips %u->%u, "
+                     "%llu->%llu KB, binding %d site %d target %d, region gpu-modified %d, old flags "
+                     "%#x: insert %llu, refresh %llu, copy %llu, free %llu us\n",
+                     static_cast<unsigned long long>(info.guest_address), info.size.width,
+                     info.size.height, info.size.depth, vk::to_string(info.pixel_format).c_str(),
+                     static_cast<u32>(info.type), lbp3_old_layers, info.resources.layers,
+                     lbp3_old_levels, info.resources.levels,
+                     static_cast<unsigned long long>(lbp3_old_size / 1024),
+                     static_cast<unsigned long long>(info.guest_size / 1024), g_lbp3ExpandBinding,
+                     g_lbp3ExpandSite, lbp3_old_target ? 1 : 0, lbp3_gpu_modified ? 1 : 0,
+                     lbp3_old_flags, static_cast<unsigned long long>(lbp3_t1 - lbp3_t0),
+                     static_cast<unsigned long long>(lbp3_t2 - lbp3_t1),
+                     static_cast<unsigned long long>(lbp3_t3 - lbp3_t2),
+                     static_cast<unsigned long long>(lbp3_t4 - lbp3_t3));
+    }
     return new_image_id;
 }
 

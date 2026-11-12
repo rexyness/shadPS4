@@ -47,6 +47,9 @@ enum Kind : int {
     GpuImgUpload, // GPU: buffer-to-image uploads (Runtime::UploadImage)
     GpuDetile,    // GPU: detile dispatches
     GpuOverflow,  // timestamp pairs not written (pool full before a collect)
+    ImgFree,      // UniqueImage destroy (vmaDestroyImage): count, us
+    VmaFree,      // VMA's vkFreeMemory calls (device memory callback): count, bytes
+    GpuImgCopy,   // GPU: image-to-image copies (Runtime::CopyImage, e.g. ExpandImage)
     kKinds
 };
 
@@ -96,5 +99,6 @@ void CollectGpu();
 
 // VMA device memory callback (vk_instance.cpp): counts vkAllocateMemory calls made by VMA.
 void NoteVmaAllocate(uint64_t bytes);
+void NoteVmaFree(uint64_t bytes);
 
 } // namespace Lbp3Perf

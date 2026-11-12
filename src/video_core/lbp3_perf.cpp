@@ -33,6 +33,12 @@ void NoteVmaAllocate(uint64_t bytes) {
     g_counters[VmaMem].bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+void NoteVmaFree(uint64_t bytes) {
+    if (!g_on) return;
+    g_counters[VmaFree].n.fetch_add(1, std::memory_order_relaxed);
+    g_counters[VmaFree].bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 void InitGpu(const Vulkan::Instance& instance) {
     if (!g_gpuOn) return;
     std::lock_guard lk(g_mutex);

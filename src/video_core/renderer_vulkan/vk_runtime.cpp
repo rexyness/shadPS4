@@ -319,8 +319,10 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
+    const int lbp3_q = Lbp3Perf::GpuBegin(cmdbuf);  // LBP3: milestone 5 measurement
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, regions);
+    Lbp3Perf::GpuEnd(cmdbuf, lbp3_q, Lbp3Perf::GpuImgCopy);
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
