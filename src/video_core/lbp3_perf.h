@@ -51,6 +51,7 @@ enum Kind : int {
     VmaFree,      // VMA's vkFreeMemory calls (device memory callback): count, bytes
     GpuImgCopy,   // GPU: image-to-image copies (Runtime::CopyImage, e.g. ExpandImage)
     Memcpy,       // guest memory -> staging copies (CopySparseMemory) in buffer and image uploads
+    ZeroCopy,     //   ... 4 KB chunks of those copies that were all zero (LBP3_FIRST_FRAME only): bytes
     kKinds
 };
 
