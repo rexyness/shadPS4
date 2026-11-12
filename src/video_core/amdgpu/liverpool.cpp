@@ -20,6 +20,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/platform.h"
+#include "video_core/amdgpu/lbp3_gfx_wait_trace.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -70,7 +71,16 @@ static std::atomic<u32> recent_label_write_count{};
 static void NoteLabelWrite(const char* source, u64 address, u64 data) {
     recent_label_writes[recent_label_write_count++ % recent_label_writes.size()] = {source,
                                                                                     address, data};
+    if (Lbp3Trace::On()) Lbp3Trace::NoteWrite(source, address, data);
 }
+
+// LBP3_GFX_WAIT_TRACE: where the current graphics packet sits, for the trace's W and I rows.
+#define LBP3_TRACE_GFX_CTX()                                                                       \
+    if (Lbp3Trace::On()) {                                                                         \
+        Lbp3Trace::ctx_buf = static_cast<int>(lbp3_buffer_index);                                  \
+        Lbp3Trace::ctx_off_end =                                                                   \
+            static_cast<int>(lbp3_dcb_end - reinterpret_cast<const u32*>(header));                 \
+    }
 
 // Whether a command stream wrote the 8 bytes at address since write number `since`.
 static bool LabelWrittenSince(u64 address, u32 since) {
@@ -98,24 +108,121 @@ Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr, bool gfx) {
 }
 
 void Liverpool::EndBlockedWait(const BlockedWait& wait) {
-    std::scoped_lock lk{submit_mutex};
-    --queues_blocked_on_wait;
-    if (wait.gfx) {
-        --gfx_blocked_on_wait;
-        lbp3_gfx_blocked_ns += static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait.start).count());
-        ++lbp3_gfx_blocked_waits;
-        lbp3_gfx_blocked_since_ns = 0;
+    int lbp3_trace_event = 0;  // LBP3_GFX_WAIT_TRACE: 1 learned, -1 forgotten
+    {
+        std::scoped_lock lk{submit_mutex};
+        --queues_blocked_on_wait;
+        if (wait.gfx) {
+            --gfx_blocked_on_wait;
+            lbp3_gfx_blocked_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait.start).count());
+            ++lbp3_gfx_blocked_waits;
+            lbp3_gfx_blocked_since_ns = 0;
+        }
+        if (!wait.addr) return;
+        const auto known = std::find(guest_written_waits.begin(), guest_written_waits.end(), wait.addr);
+        if (LabelWrittenSince(wait.addr, wait.label_writes)) {
+            if (known != guest_written_waits.end()) {
+                guest_written_waits.erase(known);
+                lbp3_trace_event = -1;
+            }
+        } else if (grace_releases != wait.grace_releases && known == guest_written_waits.end() &&
+                   guest_written_waits.size() < 256) {
+            guest_written_waits.push_back(wait.addr);
+            ++learned_waits;
+            lbp3_trace_event = 1;
+        }
     }
-    if (!wait.addr) return;
-    const auto known = std::find(guest_written_waits.begin(), guest_written_waits.end(), wait.addr);
-    if (LabelWrittenSince(wait.addr, wait.label_writes)) {
-        if (known != guest_written_waits.end()) guest_written_waits.erase(known);
-    } else if (grace_releases != wait.grace_releases && known == guest_written_waits.end() &&
-               guest_written_waits.size() < 256) {
-        guest_written_waits.push_back(wait.addr);
-        ++learned_waits;
+    if (lbp3_trace_event && Lbp3Trace::On()) {
+        Lbp3Trace::Row("%s,%lld,%u,%#llx,%d\n", lbp3_trace_event > 0 ? "L" : "X",
+                       Lbp3Trace::Us(Lbp3Trace::NowNs()), Lbp3Trace::flips.load(),
+                       static_cast<unsigned long long>(wait.addr), wait.gfx ? 1 : 0);
     }
+}
+
+// LBP3_GFX_WAIT_TRACE (lbp3_gfx_wait_trace.h): the rows for blocked waits. Command-processor
+// thread only; guest_written_waits is changed only on this thread, so it is read here unlocked.
+Lbp3Trace::Wait Liverpool::TraceGfxWaitBegin(u32 kind, u64 addr, u32 ref, u32 mask, u32 func,
+                                             int buf, int off_end, size_t size, bool top) {
+    using namespace Lbp3Trace;
+    Wait w{};
+    w.Begin(0, kind, addr, ref, mask, func);
+    const auto& c = compute;
+    const u64 c_value = c.parked ? ReadValue(c.kind, c.addr) : 0;
+    const bool c_sat = c.parked && c.addr && Satisfied(c.kind, c.addr, c.ref, c.mask, c.func);
+    size_t c_pending = 0;
+    for (u32 q = 1; q < num_mapped_queues; ++q) {
+        std::scoped_lock lock{mapped_queues[q].m_access};
+        c_pending += mapped_queues[q].submits.size();
+    }
+    const bool known = addr && std::find(guest_written_waits.begin(), guest_written_waits.end(),
+                                         addr) != guest_written_waits.end();
+    Row("GB,%lld,%u,%s,%#llx,%#llx,%#x,%#x,%u,%d,%d,%zu,%d,%d,%#llx,%#llx,%#x,%u,%d,%zu,%d\n",
+        Us(w.begin_ns), flips.load(), kind ? "sem" : "wrm", static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(ReadValue(kind, addr)), ref, mask, func, buf, off_end, size,
+        top ? 1 : 0, c.parked ? 1 : 0, static_cast<unsigned long long>(c.addr),
+        static_cast<unsigned long long>(c_value), c.ref, c.func, c_sat ? 1 : 0, c_pending,
+        known ? 1 : 0);
+    return w;
+}
+
+void Liverpool::TraceGfxWaitEnd(const Lbp3Trace::Wait& w, u32 kind) {
+    using namespace Lbp3Trace;
+    const s64 end = NowNs();
+    WatchResult r{};
+    if (w.addr) r = Disarm(0, w.gen);
+    const Lbp3Trace::TraceWrite* lw = w.addr ? LatestWrite(w.addr, w.write_since) : nullptr;
+    Row("GE,%lld,%u,%#llx,%#llx,%.1f,%u,%.1f,%.1f,%.1f,%llu,%.1f,%llu,%llu,%.1f,%lld,%lld,%s,%lld,"
+        "%d,%#llx,%llu,%.1f,%llu,%llu,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+        Us(end), flips.load(), static_cast<unsigned long long>(w.addr),
+        static_cast<unsigned long long>(ReadValue(kind, w.addr)), DUs(end - w.begin_ns), w.polls,
+        DUs(w.max_gap_ns), DUs(acc_gres_ns - w.gres0), DUs(acc_cres_ns - w.cres0),
+        static_cast<unsigned long long>(acc_cres_n - w.cres_n0), DUs(acc_cadv_ns - w.cadv0),
+        static_cast<unsigned long long>(compute_packets - w.cpk0),
+        static_cast<unsigned long long>(compute_dispatches - w.cdisp0), DUs(acc_pc_ns - w.pc0),
+        r.sat_ns >= 0 ? Us(r.sat_ns) : -1LL, r.first_ns >= 0 ? Us(r.first_ns) : -1LL,
+        lw ? lw->source : "cpu", lw ? Us(lw->ns) : -1LL, compute.parked ? 1 : 0,
+        static_cast<unsigned long long>(compute.addr),
+        static_cast<unsigned long long>(fault_n.load() - w.fault_n0),
+        DUs(static_cast<s64>(fault_ns.load() - w.fault_ns0)),
+        static_cast<unsigned long long>(fault_cp_n.load() - w.fault_cp_n0),
+        static_cast<unsigned long long>(protect_cp_n.load() - w.prot_cp_n0),
+        DUs(static_cast<s64>(protect_cp_ns.load() - w.prot_cp_ns0)),
+        static_cast<unsigned long long>(protect_n.load() - w.prot_n0),
+        DUs(static_cast<s64>(protect_ns.load() - w.prot_ns0)),
+        DUs(static_cast<s64>(vq_ns.load() - w.vq0)), DUs(static_cast<s64>(vp_ns.load() - w.vp0)),
+        DUs(static_cast<s64>(vq_cp_ns.load() - w.vq_cp0)),
+        DUs(static_cast<s64>(vp_cp_ns.load() - w.vp_cp0)));
+}
+
+Lbp3Trace::Wait Liverpool::TraceComputeWaitBegin(u32 kind, u64 addr, u32 ref, u32 mask,
+                                                 u32 func) {
+    using namespace Lbp3Trace;
+    Wait w{};
+    w.Begin(1, kind, addr, ref, mask, func);
+    compute = {true, kind, addr, ref, mask, func};
+    const bool known = addr && std::find(guest_written_waits.begin(), guest_written_waits.end(),
+                                         addr) != guest_written_waits.end();
+    Row("CB,%lld,%u,%s,%#llx,%#llx,%#x,%#x,%u,%d,%u\n", Us(w.begin_ns), flips.load(),
+        kind ? "sem" : "wrm", static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(ReadValue(kind, addr)), ref, mask, func, known ? 1 : 0,
+        gfx_blocked_on_wait.load());
+    return w;
+}
+
+void Liverpool::TraceComputeWaitEnd(const Lbp3Trace::Wait& w, u32 kind) {
+    using namespace Lbp3Trace;
+    const s64 end = NowNs();
+    WatchResult r{};
+    if (w.addr) r = Disarm(1, w.gen);
+    compute.parked = false;
+    const Lbp3Trace::TraceWrite* lw = w.addr ? LatestWrite(w.addr, w.write_since) : nullptr;
+    Row("CE,%lld,%u,%#llx,%#llx,%.1f,%u,%.1f,%.1f,%.1f,%lld,%lld,%s,%lld\n", Us(end), flips.load(),
+        static_cast<unsigned long long>(w.addr),
+        static_cast<unsigned long long>(ReadValue(kind, w.addr)), DUs(end - w.begin_ns), w.polls,
+        DUs(w.max_gap_ns), DUs(acc_gres_ns - w.gres0), DUs(acc_pc_ns - w.pc0),
+        r.sat_ns >= 0 ? Us(r.sat_ns) : -1LL, r.first_ns >= 0 ? Us(r.first_ns) : -1LL,
+        lw ? lw->source : "cpu", lw ? Us(lw->ns) : -1LL);
 }
 
 // DMA_DATA with an immediate value fills the GPU copy of memory; also write guest memory,
@@ -194,6 +301,7 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    Lbp3Trace::cp_tid = Lbp3Trace::ThreadId();
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
@@ -213,7 +321,13 @@ void Liverpool::Process(std::stop_token stoken) {
         curr_qid = -1;
 
         while (num_submits || num_commands) {
-            ProcessCommands();
+            if (Lbp3Trace::On()) {
+                const s64 t0 = Lbp3Trace::NowNs();
+                ProcessCommands();
+                Lbp3Trace::acc_pc_ns += Lbp3Trace::NowNs() - t0;
+            } else {
+                ProcessCommands();
+            }
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 
@@ -227,7 +341,21 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            task.resume();
+            if (Lbp3Trace::On()) {
+                const u64 packets0 = Lbp3Trace::compute_packets;
+                const s64 t0 = Lbp3Trace::NowNs();
+                task.resume();
+                const s64 dt = Lbp3Trace::NowNs() - t0;
+                if (curr_qid == GfxQueueId) {
+                    Lbp3Trace::acc_gres_ns += dt;
+                } else {
+                    Lbp3Trace::acc_cres_ns += dt;
+                    ++Lbp3Trace::acc_cres_n;
+                    if (Lbp3Trace::compute_packets != packets0) Lbp3Trace::acc_cadv_ns += dt;
+                }
+            } else {
+                task.resume();
+            }
 
             if (task.done()) {
                 task.destroy();
@@ -480,6 +608,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const u32* const nop_at = reinterpret_cast<const u32*>(header);
                     if (top_level && nop_at + 59 == lbp3_dcb_end) {
                         lbp3_gfx_buffers_since_flip = 0;
+                        if (Lbp3Trace::On()) {
+                            const u32 flip = ++Lbp3Trace::flips;
+                            Lbp3Trace::Row("F,%lld,%u\n", Lbp3Trace::Us(Lbp3Trace::NowNs()), flip);
+                            Lbp3Trace::Flush();
+                        }
                         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     } else {
                         // Once per position (dword offset, buffer size, NOP size), at most 32
@@ -892,6 +1025,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                LBP3_TRACE_GFX_CTX();
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
@@ -912,6 +1046,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                LBP3_TRACE_GFX_CTX();
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
@@ -921,7 +1056,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         auto* memory = Core::Memory::Instance();
                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                     },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                    [] {
+                        if (Lbp3Trace::On()) {
+                            Lbp3Trace::Row("I,%lld,%u,%d,%d\n", Lbp3Trace::Us(Lbp3Trace::NowNs()),
+                                           Lbp3Trace::flips.load(), Lbp3Trace::ctx_buf,
+                                           Lbp3Trace::ctx_off_end);
+                        }
+                        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                    });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -972,6 +1114,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                LBP3_TRACE_GFX_CTX();
                 if (!write_data->wr_one_addr.Value()) {
                     if (rasterizer) {
                         rasterizer->OnFence();
@@ -1002,6 +1145,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     if (!mem_semaphore->Signaled()) {
                         const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>(), true);
+                        Lbp3Trace::Wait lbp3_tw{};
+                        if (Lbp3Trace::On()) {
+                            LBP3_TRACE_GFX_CTX();
+                            lbp3_tw = TraceGfxWaitBegin(1, mem_semaphore->Address<u64>(), 0, 0, 0,
+                                                        Lbp3Trace::ctx_buf, Lbp3Trace::ctx_off_end,
+                                                        lbp3_dcb_end - lbp3_dcb_begin, top_level);
+                        }
                         const auto wait_start = std::chrono::steady_clock::now();
                         bool reported = false;
                         while (!mem_semaphore->Signaled()) {
@@ -1013,7 +1163,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             mem_semaphore->Address<u64>());
                             }
                             YIELD_GFX();
+                            if (lbp3_tw.on) lbp3_tw.Poll();
                         }
+                        if (lbp3_tw.on) TraceGfxWaitEnd(lbp3_tw, 1);
                         EndBlockedWait(blocked);
                     }
                     mem_semaphore->Decrement();
@@ -1052,6 +1204,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
                                          ? wait_reg_mem->Address<u64>()
                                          : 0, true);
+                    Lbp3Trace::Wait lbp3_tw{};
+                    if (Lbp3Trace::On()) {
+                        LBP3_TRACE_GFX_CTX();
+                        const bool memory =
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                        lbp3_tw = TraceGfxWaitBegin(
+                            0, memory ? wait_reg_mem->Address<u64>() : 0, wait_reg_mem->ref,
+                            wait_reg_mem->mask, static_cast<u32>(wait_reg_mem->function.Value()),
+                            Lbp3Trace::ctx_buf, Lbp3Trace::ctx_off_end,
+                            lbp3_dcb_end - lbp3_dcb_begin, top_level);
+                    }
                     const auto wait_start = std::chrono::steady_clock::now();
                     bool reported = false;
                     while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1065,7 +1228,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                    : regs.reg_array[wait_reg_mem->Reg()]);
                         }
                         YIELD_GFX();
+                        if (lbp3_tw.on) lbp3_tw.Poll();
                     }
+                    if (lbp3_tw.on) TraceGfxWaitEnd(lbp3_tw, 0);
                     EndBlockedWait(blocked);
                 }
                 break;
@@ -1343,6 +1508,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            ++Lbp3Trace::compute_dispatches;
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                     fmt::make_format_args(vqid, cmd_address),
@@ -1362,6 +1528,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            ++Lbp3Trace::compute_dispatches;
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchIndirect",
                                     fmt::make_format_args(vqid, cmd_address),
@@ -1392,6 +1559,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 if (!mem_semaphore->Signaled()) {
                     const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>());
+                    Lbp3Trace::Wait lbp3_tw{};
+                    if (Lbp3Trace::On()) {
+                        lbp3_tw = TraceComputeWaitBegin(1, mem_semaphore->Address<u64>(), 0, 0, 0);
+                    }
                     const auto wait_start = std::chrono::steady_clock::now();
                     bool reported = false;
                     while (!mem_semaphore->Signaled()) {
@@ -1403,7 +1574,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                         mem_semaphore->Address<u64>());
                         }
                         YIELD_ASC(vqid);
+                        if (lbp3_tw.on) lbp3_tw.Poll();
                     }
+                    if (lbp3_tw.on) TraceComputeWaitEnd(lbp3_tw, 1);
                     EndBlockedWait(blocked);
                 }
                 mem_semaphore->Decrement();
@@ -1417,6 +1590,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
                                      ? wait_reg_mem->Address<u64>()
                                      : 0);
+                Lbp3Trace::Wait lbp3_tw{};
+                if (Lbp3Trace::On()) {
+                    const bool memory =
+                        wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                    lbp3_tw = TraceComputeWaitBegin(
+                        0, memory ? wait_reg_mem->Address<u64>() : 0, wait_reg_mem->ref,
+                        wait_reg_mem->mask, static_cast<u32>(wait_reg_mem->function.Value()));
+                }
                 const auto wait_start = std::chrono::steady_clock::now();
                 bool reported = false;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1430,7 +1611,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                                : regs.reg_array[wait_reg_mem->Reg()]);
                     }
                     YIELD_ASC(vqid);
+                    if (lbp3_tw.on) lbp3_tw.Poll();
                 }
+                if (lbp3_tw.on) TraceComputeWaitEnd(lbp3_tw, 0);
                 EndBlockedWait(blocked);
             }
             break;
@@ -1444,6 +1627,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                            release_mem->DataQWord());
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
+                    if (Lbp3Trace::On()) {
+                        Lbp3Trace::Row("CI,%lld,%u,%u\n", Lbp3Trace::Us(Lbp3Trace::NowNs()),
+                                       Lbp3Trace::flips.load(), static_cast<u32>(pipe_id));
+                    }
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
                 },
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
@@ -1461,6 +1648,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         acb = NextPacket(acb, next_dw_off);
+        ++Lbp3Trace::compute_packets;
 
         if constexpr (!is_indirect) {
             *queue.read_addr += next_dw_off;
@@ -1506,6 +1694,10 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    if (Lbp3Trace::On()) {
+        Lbp3Trace::Row("GS,%lld,%u,%u,%zu\n", Lbp3Trace::Us(Lbp3Trace::NowNs()),
+                       Lbp3Trace::flips.load(), Lbp3Trace::ThreadId(), dcb.size());
+    }
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
@@ -1526,6 +1718,10 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     auto& queue = mapped_queues[gnm_vqid];
+    if (Lbp3Trace::On()) {
+        Lbp3Trace::Row("CS,%lld,%u,%u,%zu\n", Lbp3Trace::Us(Lbp3Trace::NowNs()),
+                       Lbp3Trace::flips.load(), Lbp3Trace::ThreadId(), acb.size());
+    }
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);

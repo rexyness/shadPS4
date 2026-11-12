@@ -32,6 +32,10 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+namespace Lbp3Trace {
+struct Wait;  // lbp3_gfx_wait_trace.h
+}
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -335,6 +339,13 @@ private:
     // wrote the address meanwhile, the guest's CPU wrote it: remember the address. If a
     // command stream wrote it, forget it (a GPU-side label must be waited out).
     void EndBlockedWait(const BlockedWait& wait);
+
+    // LBP3_GFX_WAIT_TRACE (lbp3_gfx_wait_trace.h, measurement only): the GB/GE and CB/CE rows.
+    Lbp3Trace::Wait TraceGfxWaitBegin(u32 kind, u64 addr, u32 ref, u32 mask, u32 func, int buf,
+                                      int off_end, size_t size, bool top);
+    void TraceGfxWaitEnd(const Lbp3Trace::Wait& wait, u32 kind);
+    Lbp3Trace::Wait TraceComputeWaitBegin(u32 kind, u64 addr, u32 ref, u32 mask, u32 func);
+    void TraceComputeWaitEnd(const Lbp3Trace::Wait& wait, u32 kind);
 
 public:
     std::atomic<u32> early_releases{};  // guest released from a submit while the GPU was blocked

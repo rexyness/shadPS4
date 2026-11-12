@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "video_core/amdgpu/lbp3_gfx_wait_trace.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -428,6 +429,20 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        if (AmdGpu::Lbp3Trace::On()) {  // LBP3_GFX_WAIT_TRACE: count and time (measurement only)
+            namespace T = AmdGpu::Lbp3Trace;
+            const s64 t0 = T::NowNs();
+            impl.Protect(address, size, perms);
+            const u64 dt = static_cast<u64>(T::NowNs() - t0);
+            if (std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread()) {
+                ++T::protect_cp_n;
+                T::protect_cp_ns += dt;
+            } else {
+                ++T::protect_n;
+                T::protect_ns += dt;
+            }
+            return;
+        }
         impl.Protect(address, size, perms);
     }
 
@@ -436,12 +451,25 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        namespace T = AmdGpu::Lbp3Trace;
+        const s64 lbp3_t0 = T::On() ? T::NowNs() : 0;  // LBP3_GFX_WAIT_TRACE (measurement only)
+        bool handled;
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
         } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            handled = rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
-        return false;
+        if (lbp3_t0) {
+            const u64 dt = static_cast<u64>(T::NowNs() - lbp3_t0);
+            if (is_gpu_thread) {
+                ++T::fault_cp_n;
+                T::fault_cp_ns += dt;
+            } else {
+                ++T::fault_n;
+                T::fault_ns += dt;
+            }
+        }
+        return handled;
     }
 };
 
