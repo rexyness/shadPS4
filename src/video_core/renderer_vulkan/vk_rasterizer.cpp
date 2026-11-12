@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -183,6 +189,143 @@ void Rasterizer::EliminateFastClear() {
 
 // LBP3 debug: while set, every draw is logged (targets, sampled images, shaders).
 std::atomic<bool> g_lbp3TraceDraws{false};
+
+// LBP3: the game clears its render targets with a compute "masked fill", cs 5c5e1be6:
+//   for i < min(cb[0], dst.num_records): dst[i] = (dst[i] & ~mask[i & cb[1]]) |
+//                                                 (value[i & cb[1]] & mask[i & cb[1]])
+// over a render target's memory, as a raw buffer. The texture cache then flagged every image
+// in that memory and re-uploaded each whole at its next use (~26 images, ~107 MB, ~4 ms of
+// GPU a frame in a level), after copying the one at the fill's base into the buffer first.
+// With cb[1] == 0 and mask ffffffff the fill writes one 32-bit word over the range and reads
+// nothing, so the images inside it are cleared to that word instead, and the copy is skipped.
+// LBP3_RT_FILLS=old: as before; =presync: only skip the copy.
+static constexpr u64 kLbp3MaskedFill = 0x5c5e1be6e0ada38cULL;
+
+static int Lbp3FillMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("LBP3_RT_FILLS");
+        if (v && std::strcmp(v, "old") == 0) {
+            return 0;
+        }
+        if (v && std::strcmp(v, "presync") == 0) {
+            return 1;
+        }
+        return 2;
+    }();
+    return mode;
+}
+
+void Rasterizer::DetectLbp3Fill(const Shader::Info& cs, const AmdGpu::ComputeProgram& program) {
+    lbp3_fill = {};
+    if (cs.pgm_hash != kLbp3MaskedFill || Lbp3FillMode() == 0) {
+        return;
+    }
+    // Its buffers, in binding order: cb (16 bytes), mask (4), dst (written), value (4).
+    std::array<AmdGpu::Buffer, 4> sharps{};
+    std::array<bool, 4> written{};
+    u32 n = 0;
+    for (const auto& desc : cs.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (n == 4) {
+            return;
+        }
+        written[n] = desc.is_written;
+        sharps[n++] = desc.GetSharp(cs);
+    }
+    if (n != 4 || written[0] || written[1] || !written[2] || written[3]) {
+        return;
+    }
+    const auto& cb = sharps[0];
+    const auto& mask = sharps[1];
+    const auto& dst = sharps[2];
+    const auto& value = sharps[3];
+    if (cb.base_address == 0 || cb.GetSize() < 8 || mask.base_address == 0 ||
+        mask.GetSize() < 4 || value.base_address == 0 || value.GetSize() < 4 ||
+        dst.base_address == 0) {
+        return;
+    }
+    // Its parameters are read from memory here, so only while the CPU's copy is current.
+    if (buffer_cache.IsRegionGpuModified(cb.base_address, 8) ||
+        buffer_cache.IsRegionGpuModified(mask.base_address, 4) ||
+        buffer_cache.IsRegionGpuModified(value.base_address, 4)) {
+        return;
+    }
+    const u32 count = reinterpret_cast<const u32*>(cb.base_address)[0];
+    const u32 index_mask = reinterpret_cast<const u32*>(cb.base_address)[1];
+    const u32 m = *reinterpret_cast<const u32*>(mask.base_address);
+    const u32 v = *reinterpret_cast<const u32*>(value.base_address);
+    const u64 dst_size = memory->ClampRangeSize(dst.base_address, dst.GetSize());
+    // One thread per word, along x.
+    const u64 threads = u64(program.dim_x) * program.num_thread_x.full;
+    const bool one_dim = program.dim_y == 1 && program.dim_z == 1 &&
+                         program.num_thread_y.full <= 1 && program.num_thread_z.full <= 1 &&
+                         program.start_x == 0 && program.start_y == 0 && program.start_z == 0;
+    // dst as 32-bit records, as the shader indexes it, with at least `count` of them.
+    const bool full = index_mask == 0 && m == 0xffffffffu && count != 0 && dst.stride == 4 &&
+                      dst.num_records >= count && u64(count) * 4 <= dst_size && one_dim &&
+                      threads >= count;
+    if (!full) {
+        if (VideoCore::Lbp3FillLog()) {
+            static std::mutex mutex;
+            static std::set<u64> seen;
+            std::scoped_lock lk{mutex};
+            if (seen.insert(dst.base_address * 31 + u64(m) * 7 + v + index_mask).second) {
+                std::fprintf(stderr,
+                             "[fills] fill %llx+%llx mask %08x value %08x cb %08x %08x, "
+                             "%ux%ux%u: kept (not a full overwrite)\n",
+                             (unsigned long long)dst.base_address, (unsigned long long)dst_size,
+                             m, v, count, index_mask, program.dim_x, program.dim_y,
+                             program.dim_z);
+            }
+        }
+        return;
+    }
+    lbp3_fill = {dst.base_address, u64(count) * 4, v};
+}
+
+void Rasterizer::ApplyLbp3FillClears() {
+    for (const auto& [image_id, clear] : lbp3_fill_clears) {
+        auto& image = texture_cache.GetImage(image_id);
+        const VideoCore::SubresourceRange range = {
+            .base = {.level = 0, .layer = 0},
+            .extent = image.info.resources,
+        };
+        // As the re-upload this replaces: on the image's own sample count, and GpuModified
+        // left as it was (it decides downloads and which image a buffer sync copies from;
+        // ClearImage sets it).
+        const bool gpu_modified = True(image.flags & VideoCore::ImageFlagBits::GpuModified);
+        runtime.SetBackingSamples(&image, image.info.num_samples, false);
+        if (image.info.props.is_depth) {
+            scheduler.EndRendering();
+            if (runtime.Transit(&image, vk::ImageLayout::eTransferDstOptimal,
+                                vk::PipelineStageFlagBits2::eClear,
+                                vk::AccessFlagBits2::eTransferWrite, range)) {
+                runtime.FlushBarriers();
+            }
+            const vk::ImageSubresourceRange vk_range = {
+                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+                .baseMipLevel = 0,
+                .levelCount = range.extent.levels,
+                .baseArrayLayer = 0,
+                .layerCount = range.extent.layers,
+            };
+            scheduler.CommandBuffer().clearDepthStencilImage(
+                image.GetImage(), vk::ImageLayout::eTransferDstOptimal, clear.depthStencil,
+                vk_range);
+            image.flags &= ~VideoCore::ImageFlagBits::Dirty;
+        } else {
+            runtime.ClearImage(&image, range, clear);
+        }
+        if (!gpu_modified) {
+            image.flags &= ~VideoCore::ImageFlagBits::GpuModified;
+        }
+        ++VideoCore::g_lbp3FillClears;
+        VideoCore::g_lbp3FillClearBytes += image.info.guest_size;
+    }
+    lbp3_fill_clears.clear();
+}
 // Index of the current traced draw/dispatch (1-based, same numbering as the log)
 // and an optional callback run right after each traced draw executes.
 u32 g_lbp3TraceIndex = 0;
@@ -386,9 +529,14 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    DetectLbp3Fill(cs, cs_program);
+    const bool bound = BindResources(pipeline);
+    lbp3_fill = {};
+    if (!bound) {
+        lbp3_fill_clears.clear();
         return;
     }
+    ApplyLbp3FillClears();
     if (g_lbp3TraceDraws) {
         ++g_lbp3TraceIndex;
         std::string line = "[dispatch] #" + std::to_string(g_lbp3TraceIndex);
@@ -901,8 +1049,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                // LBP3: the destination of a fill that overwrites it (DetectLbp3Fill).
+                const bool lbp3_fill_dst = desc.is_written && lbp3_fill.written != 0 &&
+                                           vsharp.base_address == lbp3_fill.dst &&
+                                           lbp3_fill.written <= size;
+                if (lbp3_fill_dst) {
+                    buffer_cache.SetLbp3FullOverwrite(lbp3_fill.dst, lbp3_fill.written);
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                if (lbp3_fill_dst) {
+                    buffer_cache.SetLbp3FullOverwrite(0, 0);
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -914,7 +1072,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    if (lbp3_fill_dst && Lbp3FillMode() == 2) {
+                        texture_cache.InvalidateMemoryFromFill(
+                            vsharp.base_address, size, lbp3_fill.written, lbp3_fill.value,
+                            stage.pgm_hash, lbp3_fill_clears);
+                    } else {
+                        texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size,
+                                                              stage.pgm_hash);
+                    }
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }

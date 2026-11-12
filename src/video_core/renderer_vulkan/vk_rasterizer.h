@@ -135,6 +135,10 @@ private:
 
     void ResetBindings(bool is_compute);
 
+    // LBP3: the game's render-target fill (perf/reuploads.md).
+    void DetectLbp3Fill(const Shader::Info& cs, const AmdGpu::ComputeProgram& program);
+    void ApplyLbp3FillClears();
+
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
@@ -182,6 +186,15 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    // LBP3: the masked fill being bound, when it overwrites dst's first `written` bytes with
+    // `value` (written == 0: none), and the images to clear before its dispatch.
+    struct Lbp3Fill {
+        VAddr dst{};
+        u64 written{};
+        u32 value{};
+    } lbp3_fill;
+    std::vector<std::pair<VideoCore::ImageId, vk::ClearValue>> lbp3_fill_clears;
 };
 
 } // namespace Vulkan

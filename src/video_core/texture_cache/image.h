@@ -156,6 +156,7 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    u64 lbp3_writer{};  ///< LBP3: hash of the last shader that flagged it GpuDirty (fill log)
 
     struct {
         u32 texture : 1;

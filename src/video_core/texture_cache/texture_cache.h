@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
+#include <vector>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 
@@ -29,6 +31,16 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+
+// LBP3 (milestone 5, perf/reuploads.md): image refreshes and the game's render-target fills,
+// counted for the [fills] status line (taken and reset there): refreshes and their bytes,
+// refreshes with a CPU-dirty flag, images cleared in place of a re-upload, the buffer-cache
+// pre-syncs (an image tiled into the buffer before a shader writes it) and the ones skipped.
+extern std::atomic<u32> g_lbp3Refreshes, g_lbp3RefreshesCpu, g_lbp3FillClears, g_lbp3PreSyncs,
+    g_lbp3PreSyncSkips;
+extern std::atomic<u64> g_lbp3RefreshBytes, g_lbp3FillClearBytes, g_lbp3PreSyncBytes;
+// LBP3_FILL_LOG=1: one line per distinct refreshed image and per distinct fill.
+bool Lbp3FillLog();
 
 class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
@@ -108,7 +120,16 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+    /// (LBP3: `writer` is the writing shader's hash, kept for the LBP3_FILL_LOG lines.)
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, u64 writer = 0);
+
+    /// LBP3: as InvalidateMemoryFromGPU, for the game's masked fill with a full mask, which
+    /// writes the 32-bit word `value` over [address, address + written). Images wholly inside
+    /// that range whose texels the word reproduces exactly are added to `clears` (the caller
+    /// clears them before the dispatch) instead of being flagged for a re-upload.
+    void InvalidateMemoryFromFill(VAddr address, size_t max_size, size_t written, u32 value,
+                                  u64 writer,
+                                  std::vector<std::pair<ImageId, vk::ClearValue>>& clears);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);

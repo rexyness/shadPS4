@@ -358,6 +358,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (is_written) {
         const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
         if (image_id && texture_cache.GetImage(image_id).info.guest_address == device_addr) {
+            // Unless the write covers the whole image without reading it (a full-mask fill):
+            // then the copy is overwritten before anything reads it.
+            const auto& info = texture_cache.GetImage(image_id).info;
+            if (lbp3_overwrite_size != 0 && device_addr >= lbp3_overwrite_addr &&
+                device_addr + info.guest_size <= lbp3_overwrite_addr + lbp3_overwrite_size) {
+                ++g_lbp3PreSyncSkips;
+                return false;
+            }
+            ++g_lbp3PreSyncs;
+            g_lbp3PreSyncBytes += info.guest_size;
             return SynchronizeMemoryFromImage(arena, device_addr, size);
         }
     }

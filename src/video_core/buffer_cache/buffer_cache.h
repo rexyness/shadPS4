@@ -101,6 +101,14 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// LBP3: the next ObtainBuffer calls write every byte of [addr, addr + size) without
+    /// reading it (the game's masked fill with a full mask), so an image lying wholly inside
+    /// it needn't be copied into the buffer first. (0, 0) ends it.
+    void SetLbp3FullOverwrite(VAddr addr, u64 size) {
+        lbp3_overwrite_addr = addr;
+        lbp3_overwrite_size = size;
+    }
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -142,6 +150,8 @@ private:
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
     bool fault_process_pending{};
+    VAddr lbp3_overwrite_addr{};
+    u64 lbp3_overwrite_size{};
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;

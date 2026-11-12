@@ -41,6 +41,102 @@ std::atomic<u32> g_lbp3ImageReadbacks{};  // images written back for the CPU (st
 // queued until its job has copied the pixels out four frames later. Set by the runtime when
 // the eboot's code matches (gpu/renderer.cpp); null otherwise.
 std::atomic<const volatile u8*> g_lbp3CaptureQueued{};
+std::atomic<u32> g_lbp3Refreshes{}, g_lbp3RefreshesCpu{}, g_lbp3FillClears{}, g_lbp3PreSyncs{},
+    g_lbp3PreSyncSkips{};
+std::atomic<u64> g_lbp3RefreshBytes{}, g_lbp3FillClearBytes{}, g_lbp3PreSyncBytes{};
+
+bool Lbp3FillLog() {
+    static const bool on = [] {
+        const char* v = std::getenv("LBP3_FILL_LOG");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
+namespace {
+// Prints `line` the first time `key` is seen (LBP3_FILL_LOG lines).
+void Lbp3LogOnce(u64 key, const std::string& line) {
+    static std::mutex mutex;
+    static absl::flat_hash_set<u64> seen;
+    std::scoped_lock lk{mutex};
+    if (seen.insert(key).second) {
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+}
+
+std::string Lbp3Describe(const Image& image) {
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "%llx+%llx %ux%ux%u L%u M%u %s %s%s",
+                  (unsigned long long)image.info.guest_address,
+                  (unsigned long long)image.info.guest_size, image.info.size.width,
+                  image.info.size.height, image.info.size.depth, image.info.resources.layers,
+                  image.info.resources.levels, vk::to_string(image.info.pixel_format).c_str(),
+                  std::string(AmdGpu::NameOf(image.info.tile_mode)).c_str(),
+                  image.info.props.is_depth ? " depth" : "");
+    return buf;
+}
+
+// The clear value whose texels hold the 32-bit word `value` repeated, as the game's masked
+// fill leaves them in memory, or false when a clear can't reproduce it exactly:
+// - zero is all zero bits in every colour format, and depth 0.0 (the depth aspect only: the
+//   re-upload doesn't write stencil either);
+// - another word only in 32-bit RGBA8/BGRA8 formats, one texel per word: UNORM (byte / 255
+//   converts back exactly) and sRGB when each colour byte is 00 or ff (0.0 and 1.0 encode
+//   exactly; alpha is linear).
+// Block-compressed and multisampled images, and other words, keep the re-upload.
+bool Lbp3FillClearValue(const Image& image, u32 value, vk::ClearValue& out) {
+    const auto& info = image.info;
+    if (info.props.is_block || info.num_samples > 1 || !image.backing) {
+        return false;
+    }
+    if (info.props.is_depth) {
+        if (value != 0) {
+            return false;
+        }
+        out.depthStencil = vk::ClearDepthStencilValue{0.0f, 0};
+        return true;
+    }
+    if (value == 0) {
+        out.color.uint32 = std::array<u32, 4>{0, 0, 0, 0};
+        return true;
+    }
+    if (image.backing->image.image_ci.format != info.pixel_format) {
+        return false; // created in a substitute format
+    }
+    const auto byte = [value](int i) { return (value >> (8 * i)) & 0xff; };
+    const auto b = [&](int i) { return float(byte(i)) / 255.0f; };
+    const auto srgb_exact = [&] {
+        for (int i = 0; i < 3; ++i) {
+            if (byte(i) != 0 && byte(i) != 0xff) {
+                return false;
+            }
+        }
+        return true;
+    };
+    switch (info.pixel_format) {
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eA8B8G8R8SrgbPack32:
+        if (!srgb_exact()) {
+            return false;
+        }
+        [[fallthrough]];
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eA8B8G8R8UnormPack32:
+        out.color.float32 = std::array<float, 4>{b(0), b(1), b(2), b(3)};
+        return true;
+    case vk::Format::eB8G8R8A8Srgb:
+        if (!srgb_exact()) {
+            return false;
+        }
+        [[fallthrough]];
+    case vk::Format::eB8G8R8A8Unorm:
+        out.color.float32 = std::array<float, 4>{b(2), b(1), b(0), b(3)};
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -194,7 +290,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     }
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, u64 writer) {
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Consider images that match base address or lie entirely inside the written range.
         // TODO: Maybe also consider subresources
@@ -206,7 +302,48 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        image.lbp3_writer = writer;
     });
+}
+
+void TextureCache::InvalidateMemoryFromFill(
+    VAddr address, size_t max_size, size_t written, u32 value, u64 writer,
+    std::vector<std::pair<ImageId, vk::ClearValue>>& clears) {
+    const bool log = Lbp3FillLog();
+    std::string line;
+    ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        const bool contained = begin >= address && end <= address + max_size;
+        if (begin != address && !contained) {
+            return;
+        }
+        // Wholly overwritten by the fill, no CPU write pending (its page tracking is left as
+        // it is), and a clear reproduces the word: clear it; it then matches its memory.
+        vk::ClearValue clear{};
+        const bool cpu_dirty =
+            True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty));
+        if (begin >= address && end <= address + written && !cpu_dirty &&
+            Lbp3FillClearValue(image, value, clear)) {
+            clears.emplace_back(image_id, clear);
+            if (log) {
+                line += " clear " + Lbp3Describe(image) + ";";
+            }
+            return;
+        }
+        image.flags |= ImageFlagBits::GpuDirty;
+        image.lbp3_writer = writer;
+        if (log) {
+            line += std::string(" re-upload") + (cpu_dirty ? " (cpu dirty) " : " ") +
+                    Lbp3Describe(image) + ";";
+        }
+    });
+    if (log) {
+        char head[120];
+        std::snprintf(head, sizeof(head), "[fills] fill %llx+%llx value %08x:",
+                      (unsigned long long)address, (unsigned long long)written, value);
+        Lbp3LogOnce(address * 31 + written * 7 + value + 1, head + line);
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -982,6 +1119,21 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+
+    // LBP3: count the refresh ([fills] status line) and, with LBP3_FILL_LOG, name it once.
+    ++g_lbp3Refreshes;
+    g_lbp3RefreshBytes += image.info.guest_size;
+    if (True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
+        ++g_lbp3RefreshesCpu;
+    }
+    if (Lbp3FillLog()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " flags %x writer %016llx", u32(image.flags),
+                      (unsigned long long)image.lbp3_writer);
+        Lbp3LogOnce(image.info.guest_address * 131 + image.info.guest_size * 17 +
+                        u64(image.info.pixel_format) * 3 + image.lbp3_writer + u32(image.flags),
+                    "[fills] refresh " + Lbp3Describe(image) + buf);
+    }
 
     SmallVector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
