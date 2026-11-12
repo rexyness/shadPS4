@@ -49,8 +49,10 @@ public:
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
+    /// base_slice (LBP3): the array layer `info`'s first slice is, when `info` describes a
+    /// range of another image's layers (TextureCache::UploadLayers).
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, u32 base_slice = 0);
 
 private:
     vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);

@@ -104,6 +104,9 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint micro_tiled_mips;
     uint num_mips;
     MipInfo mips[16];
+    // LBP3: the array layer of the buffer's first slice (a range of layers is being detiled);
+    // the pipe and bank rotations use the absolute slice, offsets the slice within the buffer.
+    uint base_slice;
 } info;
 
 uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z, uint32_t thickness) {
@@ -393,8 +396,8 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
         y %= macro_tile_height;
     }
 
-    uint32_t pipe = ComputePipeFromCoord(x, y, slice);
-    uint32_t bank = ComputeBankFromCoord(x, y, slice, tile_split_slice);
+    uint32_t pipe = ComputePipeFromCoord(x, y, slice + info.base_slice);
+    uint32_t bank = ComputeBankFromCoord(x, y, slice + info.base_slice, tile_split_slice);
 
     uint32_t pipe_interleave_mask = (1 << NUM_PIPE_INTERLEAVE_BITS) - 1;
     uint32_t pipe_interleave_offset = total_offset & pipe_interleave_mask;

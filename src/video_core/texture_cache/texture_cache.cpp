@@ -1,7 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -535,17 +543,176 @@ std::string DescribeInfo(const ImageInfo& i) {
 }
 } // namespace
 
+namespace {
+// LBP3 (milestone 5, perf/first_frame.md): LBP3 fills its lighting volumes (render-target
+// arrays of 64, 64 and 16 slices) one slice at a time, and on the first frame each slice k asks
+// for k+1 layers, so the array was expanded one layer at a time: 141 expansions in one frame,
+// each re-uploading the whole grown image from guest memory (537 MB, 521 MB of it overwritten
+// at once by the copy of the old layers) and creating, copying and freeing a new image: ~47 ms
+// of the command processor and ~60 ms of GPU work. Now a layers-only growth is rounded up to a
+// power of two (6 growths for 64 slices; 144 expansions on the Prologue route became 19) and,
+// once whole groups of the volumes' thick tiling (4 slices) are added, uploads only the new
+// layers. LBP3_EXPAND=old restores the old path.
+bool ExpandOld() {
+    static const bool old = [] {
+        const char* v = std::getenv("LBP3_EXPAND");
+        return v && std::string_view(v) == "old";
+    }();
+    return old;
+}
+
+// A growth in array layers only, of an image whose layers can be uploaded on their own: one
+// mip level, 2D (not a volume), single-sample, not block-compressed or depth, the same
+// per-layer layout in both. Returns nullptr for a layers-only growth, otherwise why not.
+const char* NotLayerGrowth(const ImageInfo& from, const ImageInfo& to) {
+    if (from.type != to.type) return "type";
+    if (from.props.is_volume || to.props.is_volume || to.type == AmdGpu::ImageType::Color3D)
+        return "volume";
+    if (from.resources.levels != 1 || to.resources.levels != 1) return "mips";
+    if (to.resources.layers <= from.resources.layers || from.resources.layers == 0) return "layers";
+    if (!(from.size == to.size)) return "size";
+    if (from.pitch != to.pitch) return "pitch";
+    if (from.pixel_format != to.pixel_format) return "format";
+    if (from.tile_mode != to.tile_mode || from.array_mode != to.array_mode) return "tiling";
+    if (from.num_bits != to.num_bits) return "bits";
+    if (from.num_samples != 1 || to.num_samples != 1) return "samples";
+    if (from.alt_tile != to.alt_tile || from.bank_swizzle != to.bank_swizzle) return "swizzle";
+    if (from.props.is_block || to.props.is_block) return "block";
+    if (from.props.is_depth || to.props.is_depth) return "depth";
+    if (from.props.is_pow2 != to.props.is_pow2 || from.props.is_tiled != to.props.is_tiled)
+        return "props";
+    // Thick tiling (LBP3's lighting volumes: 4 slices per micro tile) is fine: UploadLayers
+    // only takes whole groups of slices and falls back to the whole image otherwise.
+    if (from.guest_size % from.resources.layers != 0 || to.guest_size % to.resources.layers != 0)
+        return "layer size";
+    if (from.guest_size / from.resources.layers != to.guest_size / to.resources.layers)
+        return "layer stride";
+    return nullptr;
+}
+
+bool IsLayerGrowth(const ImageInfo& from, const ImageInfo& to) {
+    const char* why = NotLayerGrowth(from, to);
+    if (why) {
+        // Once per reason and address: what keeps an expansion off the fast path (and, for a
+        // grown array later used as a 3D image, its real depth).
+        static std::mutex m;
+        static std::set<std::pair<std::string, VAddr>> seen;
+        std::lock_guard lk(m);
+        if (seen.size() < 256 && seen.emplace(why, to.guest_address).second)
+            std::fprintf(stderr, "[gpu] expand: not a layers-only growth (%s): %s -> %s\n", why,
+                         DescribeInfo(from).c_str(), DescribeInfo(to).c_str());
+    }
+    return why == nullptr;
+}
+} // namespace
+
+ImageInfo TextureCache::GrowLayers(const ImageInfo& requested, ImageId image_id) {
+    constexpr u32 kMaxLayers = 256;  // Vulkan's guaranteed maxImageArrayLayers
+    const u32 want = requested.resources.layers;
+    const u32 grown_layers = std::bit_ceil(want);
+    if (grown_layers == want || grown_layers > kMaxLayers) {
+        return requested;
+    }
+    ImageInfo grown = requested;
+    grown.resources.layers = grown_layers;
+    grown.UpdateSize();
+    if (grown.guest_size <= requested.guest_size ||
+        grown.guest_size / grown_layers != requested.guest_size / want) {
+        return requested;
+    }
+    // Only when no other image lives in the extra guest memory: the grown image claims it.
+    bool free = true;
+    ForEachImageInRegion(requested.guest_address + requested.guest_size,
+                         grown.guest_size - requested.guest_size, [&](ImageId id, Image&) {
+                             if (id != image_id) {
+                                 free = false;
+                             }
+                         });
+    // Every grow (a few per array): the final size per address, to check against the array's
+    // real size when the game later uses it whole.
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 512)
+        std::fprintf(stderr, "[gpu] expand: %#llx %u -> %u layers%s\n",
+                     static_cast<unsigned long long>(requested.guest_address), want,
+                     free ? grown_layers : want, free ? " (grown ahead)" : " (another image in the way)");
+    return free ? grown : requested;
+}
+
+bool TextureCache::UploadLayers(Image& image, u32 first, u32 count) {
+    const ImageInfo& info = image.info;
+    if (count == 0 || info.resources.levels != 1 || info.num_samples != 1 ||
+        first + count > info.resources.layers || info.guest_size % info.resources.layers != 0) {
+        return false;
+    }
+    // Thick tiling interleaves `thickness` slices in each micro tile, so only whole groups of
+    // them can be detiled on their own (offsets inside the buffer stay group-aligned, and the
+    // detiler adds the absolute base slice for the pipe and bank rotations).
+    const u32 thickness = AmdGpu::GetMicroTileThickness(info.array_mode);
+    if (thickness == 0 || first % thickness != 0 || count % thickness != 0) {
+        return false;
+    }
+    const u32 slice_bytes = info.guest_size / info.resources.layers;
+    ImageInfo sub = info;
+    sub.resources.layers = count;
+    sub.guest_address = info.guest_address + VAddr(first) * slice_bytes;
+    sub.UpdateSize();
+    if (sub.guest_size != slice_bytes * count) {
+        return false;
+    }
+
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    const auto [mip_size, mip_pitch, mip_height, mip_offset] = sub.mips_layout[0];
+    vk::BufferImageCopy copy{
+        .bufferOffset = mip_offset,
+        .bufferRowLength = mip_pitch,
+        .bufferImageHeight = mip_height,
+        .imageSubresource{
+            .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+            .mipLevel = 0,
+            .baseArrayLayer = first,
+            .layerCount = count,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {mip_pitch ? std::min<u32>(mip_pitch, width) : width,
+                        mip_height ? std::min<u32>(mip_height, height) : height, 1},
+    };
+
+    scheduler.EndRendering();
+    const auto [in_buffer, in_offset] =
+        buffer_cache.ObtainBufferForImage(sub.guest_address, sub.guest_size);
+    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, sub, first);
+    copy.bufferOffset += offset;
+    runtime.UploadImage(&image, buffer, {&copy, 1});
+    return true;
+}
+
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     LOG_WARNING(Render_Vulkan, "ExpandImage: {} -> {}", DescribeInfo(slot_images[image_id].info),
                 DescribeInfo(info));
     ++g_lbp3ImageExpands;
-    const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+    const ImageInfo old_info = slot_images[image_id].info;
+    const bool layer_growth = !ExpandOld() && IsLayerGrowth(old_info, info);
+    const ImageInfo new_info = layer_growth ? GrowLayers(info, image_id) : info;
+    const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info);
     RegisterImage(new_image_id);
 
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
-    RefreshImage(new_image);
+    // A layers-only growth uploads just the new layers; the old ones come from the copy below.
+    const u32 old_layers = old_info.resources.layers;
+    const bool uploaded =
+        layer_growth && UploadLayers(new_image, old_layers, new_info.resources.layers - old_layers);
+    if (layer_growth && !uploaded) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 3)
+            std::fprintf(stderr, "[gpu] expand: new-layer upload refused, whole image uploaded: %s\n",
+                         DescribeInfo(new_info).c_str());
+    }
+    if (!uploaded) {
+        RefreshImage(new_image);
+    }
     runtime.CopyImage(&src_image, &new_image);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {

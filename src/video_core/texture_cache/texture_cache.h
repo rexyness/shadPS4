@@ -155,6 +155,14 @@ public:
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
+    /// LBP3: for a layers-only growth of `image_id` to `requested`, the info to create: the
+    /// layer count rounded up to a power of two when the extra guest memory holds no other image.
+    [[nodiscard]] ImageInfo GrowLayers(const ImageInfo& requested, ImageId image_id);
+
+    /// LBP3: uploads layers [first, first + count) of a single-mip, thin 2D array from guest
+    /// memory (detiled at their absolute slice). False if the layout doesn't allow it.
+    bool UploadLayers(Image& image, u32 first, u32 count);
+
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
