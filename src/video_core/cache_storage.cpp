@@ -97,12 +97,13 @@ void DataBase::Open() {
     }
 
     const auto& game_info = Common::ElfInfo::Instance();
-    // LBP3 1440p (LBP3_RES=1440 + LBP3_RES_SHADERS=1): by default the cache is shared with
+    // LBP3 render sizes (LBP3_RES + LBP3_RES_SHADERS=1): by default the cache is shared with
     // 1080p, the rescaled shaders being kept apart by their salted hash (common/lbp3_res.h).
-    // LBP3_RES_CACHE=separate keeps the old scheme: the whole cache in <serial>_res1440.
+    // LBP3_RES_CACHE=separate keeps the old scheme: the whole cache in <serial>_res1440 (or
+    // <serial>_res<W>x<H> for the other sizes).
     std::string serial{game_info.GameSerial()};
     if (Lbp3Res::ShadersOn() && Lbp3Res::SeparateCache()) {
-        serial += "_res1440";
+        serial += Lbp3Res::SeparateSuffix();
     }
 
     using namespace Common::FS;

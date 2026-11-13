@@ -24,11 +24,12 @@ namespace Shader {
 
 namespace {
 
-// LBP3 (exp/res1440): with LBP3_RES=1440 and LBP3_RES_SHADERS=1, the shaders that carry the
-// game's 1080p render size as literals (SMAA's RT_METRICS, the composite's 1/480 bloom step,
-// the 1920x2160 stacked target's texel) get them rescaled. Both axes scale alike (2560/1920 =
-// 1440/1080 = 4/3), so a literal equal to a 1080p size v (1920, 1080 and their halves,
-// quarters and doubles) becomes v * 4/3 and one equal to 1/v becomes 3/4 of it. The list
+// LBP3 (exp/res1440, feat/resolutions): with LBP3_RES at another size and LBP3_RES_SHADERS=1,
+// the shaders that carry the game's 1080p render size as literals (SMAA's RT_METRICS, the
+// composite's 1/480 bloom step, the 1920x2160 stacked target's texel) get them rescaled. Each
+// literal follows its own axis and target (Lbp3Res::LiteralSize, the mapping the game's patches
+// use): a literal equal to a 1080p size v becomes v * (size / v), and one equal to 1/v becomes
+// (1/v) * (v / size). At 2560x1440 the factors are exactly 4/3 and 3/4, as before. The list
 // (Lbp3Res::kShaders, common/lbp3_res.h, the one list for the rescale and the cache salt) comes
 // from a scan of the translated cache (perf/res1440.md). A scan of every shader in the game data
 // (perf/res1440_shader_scan.md) found 27 more (the outline and x-ray material variants, more
@@ -40,38 +41,45 @@ bool Lbp3ResShadersOn() {
     return Lbp3Res::ShadersOn();
 }
 
-// 0 = not a 1080p size; otherwise the factor to apply (4/3 for a size, 3/4 for a reciprocal).
-float Lbp3ResFactor(float f) {
-    static constexpr float kSizes[] = {1920.f, 1080.f, 960.f, 540.f, 480.f, 270.f, 3840.f, 2160.f, 7680.f, 4320.f};
-    if (!std::isfinite(f) || f <= 0.f) return 0.f;
-    for (const float v : kSizes) {
-        if (std::fabs(f - v) <= v * 2e-6f) return 4.f / 3.f;
-        if (std::fabs(f - 1.f / v) <= (1.f / v) * 2e-6f) return 3.f / 4.f;
+// Whether f is a 1080p render-size literal (a size or its reciprocal); *k = the factor to apply
+// at `size` (0 when it keeps its value there, e.g. the quarter-size target's 480 at 720p).
+bool Lbp3ResFactor(float f, Lbp3Res::Size size, float* k) {
+    static constexpr u32 kSizes[] = {1920, 1080, 960, 540, 480, 270, 3840, 2160, 7680, 4320};
+    *k = 0.f;
+    if (!std::isfinite(f) || f <= 0.f) return false;
+    for (const u32 v : kSizes) {
+        const float fv = float(v);
+        const bool is_size = std::fabs(f - fv) <= fv * 2e-6f;
+        if (!is_size && std::fabs(f - 1.f / fv) > (1.f / fv) * 2e-6f) continue;
+        const u32 to = Lbp3Res::LiteralSize(v, size);
+        if (to != 0 && to != v) *k = is_size ? float(to) / fv : fv / float(to);
+        return true;
     }
-    return 0.f;
+    return false;
 }
 
 void Lbp3ScaleResolutionLiterals(std::vector<Gcn::GcnInst>& insts, u64 hash) {
     if (!Lbp3ResShadersOn()) return;
+    const Lbp3Res::Size size = Lbp3Res::Current();
     u64 original = hash;
-    const bool listed = Lbp3Res::IsListed(hash, &original);
+    const bool listed = Lbp3Res::IsListed(hash, &original, size);
     int changed = 0, seen = 0;
     for (auto& inst : insts) {
         for (u32 i = 0; i < inst.src_count && i < inst.src.size(); ++i) {
             auto& src = inst.src[i];
             if (src.field != Gcn::OperandField::LiteralConst) continue;
             const float f = std::bit_cast<float>(src.code);
-            const float k = Lbp3ResFactor(f);
-            if (k == 0.f) continue;
+            float k = 0.f;
+            if (!Lbp3ResFactor(f, size, &k)) continue;
             ++seen;
-            if (!listed) continue;
+            if (!listed || k == 0.f) continue;
             src.code = std::bit_cast<u32>(f * k);
             ++changed;
         }
     }
     if (listed)
-        std::fprintf(stderr, "[res] shader %#018llx: %d 1080p literals scaled for 1440p (cache key %#018llx)\n",
-                     static_cast<unsigned long long>(original), changed,
+        std::fprintf(stderr, "[res] shader %#018llx: %d 1080p literals scaled for %ux%u (%d seen; cache key %#018llx)\n",
+                     static_cast<unsigned long long>(original), changed, size.w, size.h, seen,
                      static_cast<unsigned long long>(hash));
     else if (seen)
         std::fprintf(stderr, "[res] shader %#018llx: %d 1080p-like literals, NOT on the list (unchanged)\n",
