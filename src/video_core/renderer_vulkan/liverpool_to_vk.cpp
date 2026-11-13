@@ -124,6 +124,12 @@ vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::QuadStrip:
         LOG_WARNING(Render_Vulkan, "Unimplemented primitive type, using TriangleStrip.");
         return vk::PrimitiveTopology::eTriangleStrip;
+    case AmdGpu::PrimitiveType::LineLoop:
+        // LBP3: a line loop drawn when a story level is entered straight from the Pod (the warm-up
+        // tour, perf/warmup_step.md) hit UNREACHABLE and crashed the game. Drawn as a line strip,
+        // which leaves out the closing segment, instead of crashing.
+        LOG_WARNING(Render_Vulkan, "Unimplemented primitive type LineLoop, using LineStrip.");
+        return vk::PrimitiveTopology::eLineStrip;
     case AmdGpu::PrimitiveType::AdjLineList:
         return vk::PrimitiveTopology::eLineListWithAdjacency;
     case AmdGpu::PrimitiveType::AdjLineStrip:
