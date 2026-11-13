@@ -41,6 +41,10 @@ public:
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
+    // LBP3 Recompiled: how many blobs of a type ForEachBlob will visit, from the file names
+    // only (no file is read), for the boot loading screen's progress (common/lbp3_boot.h).
+    [[nodiscard]] u32 CountBlobs(BlobType type);
+
     // LBP3 Recompiled: where the driver's VkPipelineCache is saved, beside the shader cache
     // (<serial>\driver.vkcache, or <serial>.vkcache next to an archived cache). Ported from
     // LBPPC (emurphy04), GPL-2.0-or-later, commit aad6a91 (DataBase::DriverCachePath). Only

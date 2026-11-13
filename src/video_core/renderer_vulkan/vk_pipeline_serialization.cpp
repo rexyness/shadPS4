@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <optional>
 #include <thread>
+#include "common/lbp3_boot.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -407,9 +408,23 @@ void PipelineCache::WarmUp() {
     std::vector<PreloadJob> jobs;
     preload_jobs = threads > 1 ? &jobs : nullptr;
 
+    // LBP3 Recompiled: progress for the boot loading screen (common/lbp3_boot.h). The count is
+    // a listing of the cache folder, no file reads. LBP3_PRELOAD_DELAY_US=<n> (tests only) waits
+    // n microseconds per pipeline, to stand in for a cold start after a reboot (25-40 s).
+    Lbp3Boot::Enter(Lbp3Boot::kReading,
+                    Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey));
+    u32 delay_us = 0;
+    if (const char* env = std::getenv("LBP3_PRELOAD_DELAY_US"); env && *env) {
+        delay_us = std::min<u32>(u32(std::strtoul(env, nullptr, 10)), 100000u);
+    }
+
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            Lbp3Boot::Step();
+            if (delay_us) {
+                std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+            }
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -472,9 +487,11 @@ void PipelineCache::BuildPreloaded(std::vector<PreloadJob>& jobs, u32 threads) {
         return;
     }
     threads = std::min<u32>(threads, u32(jobs.size()));
+    Lbp3Boot::Enter(Lbp3Boot::kBuilding, u32(jobs.size()));
     std::atomic<size_t> next{0};
     const auto build = [&] {
-        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
+        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();
+             Lbp3Boot::Step()) {
             auto& job = jobs[i];
             if (job.compute) {
                 job.compute_pipeline = std::make_unique<ComputePipeline>(
