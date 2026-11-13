@@ -436,11 +436,17 @@ void PipelineCache::WarmUp() {
         });
 
     preload_jobs = nullptr;
+    // Reading (keys, metas, SPIR-V, shader modules) is serial; with threads > 1 the pipelines
+    // are built afterwards, else they were built while reading.
+    const auto read_end = std::chrono::steady_clock::now();
     BuildPreloaded(jobs, threads);
-    std::fprintf(stderr, "[gpu] pipeline preload: %u of %u cached pipelines in %.2f s on %u thread%s\n",
-                 num_pipelines, num_total_pipelines,
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_start)
-                     .count(),
+    const auto build_end = std::chrono::steady_clock::now();
+    const auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    std::fprintf(stderr,
+                 "[gpu] pipeline preload: %u of %u cached pipelines in %.2f s (reading %.2f s, "
+                 "building %.2f s on %u thread%s)\n",
+                 num_pipelines, num_total_pipelines, secs(preload_start, build_end),
+                 secs(preload_start, read_end), secs(read_end, build_end),
                  threads > 1 ? std::min<u32>(threads, u32(std::max<size_t>(jobs.size(), 1))) : 1u,
                  threads > 1 && jobs.size() > 1 ? "s" : "");
 
