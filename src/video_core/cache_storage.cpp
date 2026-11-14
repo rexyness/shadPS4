@@ -14,7 +14,10 @@
 
 #include <miniz.h>
 
+#include <atomic>
 #include <condition_variable>
+#include <fstream>
+#include <memory>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -278,6 +281,69 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
             }
         }
     }
+}
+
+u32 DataBase::CountBlobs(BlobType type) {
+    const auto& ext = GetBlobFileExtension(type);
+    u32 count = 0;
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (int index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            if (std::string{file_name.data()}.ends_with(ext)) {
+                ++count;
+            }
+        }
+    } else {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+            if (entry.path().extension().string().ends_with(ext)) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+std::vector<std::jthread> DataBase::StartPrefetch(u32 threads) {
+    std::vector<std::jthread> pool;
+    if (!opened || threads == 0 || EmulatorSettings.IsPipelineCacheArchived()) {
+        return pool;
+    }
+    struct State {
+        std::vector<std::filesystem::path> files;
+        std::atomic<size_t> next{0};
+    };
+    auto state = std::make_shared<State>();
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+        // The driver cache (one big file) was read before the preload started.
+        if (entry.is_regular_file(ec) && entry.path().extension() != ".vkcache") {
+            state->files.push_back(entry.path());
+        }
+    }
+    if (state->files.empty()) {
+        return pool;
+    }
+    threads = std::min<u32>(threads, u32(state->files.size()));
+    pool.reserve(threads);
+    for (u32 t = 0; t < threads; ++t) {
+        pool.emplace_back([state](std::stop_token stop) {
+            Common::SetCurrentThreadName("lbp3:CachePrefetch");
+            std::vector<char> buffer(256 * 1024);
+            for (size_t i; !stop.stop_requested() &&
+                           (i = state->next.fetch_add(1, std::memory_order_relaxed)) <
+                               state->files.size();) {
+                // Best effort: a file that can't be read is simply skipped (no asserts here).
+                std::ifstream file{state->files[i], std::ios::binary};
+                while (file && file.read(buffer.data(), std::streamsize(buffer.size())) &&
+                       !stop.stop_requested()) {
+                }
+            }
+        });
+    }
+    return pool;
 }
 
 void DataBase::FinishPreload() {

@@ -14,6 +14,7 @@
 
 #include "common/hash.h"
 #include "common/io_file.h"
+#include "common/lbp3_boot.h"
 #include "common/path_util.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -404,6 +405,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         if (EmulatorSettings.IsPipelineCacheEnabled()) {
             Storage::DataBase::Instance().Open();
         }
+        Lbp3Boot::Enter(Lbp3Boot::kDriverCache); // the boot loading screen (common/lbp3_boot.h)
         const bool loaded = CreateDriverCache();
         WarmUp();
         // A new or rejected driver cache got every preloaded pipeline: worth saving once.
@@ -420,6 +422,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         std::fprintf(stderr,
                      "[gpu] driver pipeline cache: in memory only (LBP3_VK_PIPELINE_CACHE=off)\n");
     }
+    Lbp3Boot::Enter(Lbp3Boot::kDone);
     g_lbp3_live_cache.store(this);
 }
 
