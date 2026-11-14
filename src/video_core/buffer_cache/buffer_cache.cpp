@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
-#include <cstdio>
-#include <atomic>
 #include <algorithm>
 #include <magic_enum/magic_enum.hpp>
 
@@ -104,9 +101,6 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
-// LBP3 Recompiled: write faults that skipped the copy back (LBP3_WRITE_FAULT_NO_READBACK=1).
-std::atomic<u64> g_lbp3SkippedWriteReadbacks{};
-
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
@@ -121,30 +115,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
-        // LBP3 Recompiled: LBP3_WRITE_FAULT_NO_READBACK=1 (off by default). Ported from LBPPC
-        // (emurphy04), GPL-2.0-or-later, commit 951fb8d (LBPPC_WRITE_FAULT_NO_READBACK, on by
-        // default there: "faster in busy levels"). A guest write into GPU-written memory takes the
-        // guest's bytes as the newest instead of first copying the GPU's back, which waits for all
-        // queued GPU work. The GPU's data elsewhere in the window is dropped, so a later guest read
-        // there sees the older bytes. The bookkeeping is DownloadMemory's, without the copy.
-        static const bool no_write_readback = [] {
-            const char* env = std::getenv("LBP3_WRITE_FAULT_NO_READBACK");
-            const bool on = env && env[0] == '1';
-            if (on) {
-                std::fprintf(stderr, "[gpu] write faults into GPU-written memory skip the copy back "
-                                     "(LBP3_WRITE_FAULT_NO_READBACK=1)\n");
-            }
-            return on;
-        }();
-        if (is_write && no_write_readback) {
-            memory_tracker->ForEachDownloadRange<false>(
-                window_start, window_end - window_start,
-                [this](u64 address, u64 range) { gpu_modified_ranges.Subtract(address, range); });
-            memory_tracker->UnmarkRegionAsGpuModified(window_start, window_end - window_start, false);
-            g_lbp3SkippedWriteReadbacks.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            DownloadMemory(arena, window_start, window_end - window_start);
-        }
+        DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
