@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <algorithm>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +20,7 @@
 #include "common/io_file.h"
 #include "common/lbp3_boot.h"
 #include "common/path_util.h"
+#include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -330,6 +335,49 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
+// LBP3 Recompiled: background pipeline builds (LBP3_ASYNC_PIPELINES=1). Ported from LBPPC (emurphy04),
+// GPL-2.0-or-later, commit 951fb8d (BuildWorkers, AsyncPipelines, FinishAsyncBuilds).
+struct PipelineCache::BuildWorkers {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<GraphicsPipeline*> queue;
+    std::vector<std::jthread> threads;
+
+    explicit BuildWorkers(std::atomic<u32>& done) {
+        // A few cores: the game's own threads and the GPU thread keep the rest.
+        const u32 count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+        for (u32 i = 0; i < count; ++i) {
+            threads.emplace_back([this, &done](std::stop_token token) {
+                Common::SetCurrentThreadName("lbp3:PipelineBuild");
+                while (true) {
+                    GraphicsPipeline* pipeline;
+                    {
+                        std::unique_lock lock{mutex};
+                        Common::CondvarWait(cv, lock, token, [this] { return !queue.empty(); });
+                        if (token.stop_requested()) {
+                            return;
+                        }
+                        pipeline = queue.front();
+                        queue.pop_front();
+                    }
+                    pipeline->BuildDeferred();
+                    done.fetch_add(1, std::memory_order_release);
+                }
+            });
+        }
+        std::fprintf(stderr, "[gpu] new pipelines are built in the background on %u threads "
+                             "(LBP3_ASYNC_PIPELINES=1)\n", count);
+    }
+
+    void Submit(GraphicsPipeline* pipeline) {
+        {
+            std::scoped_lock lock{mutex};
+            queue.push_back(pipeline);
+        }
+        cv.notify_one();
+    }
+};
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -427,6 +475,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    build_workers.reset(); // waits for a build in progress
     PipelineCache* self = this;
     g_lbp3_live_cache.compare_exchange_strong(self, nullptr);
     driver_cache_saver = {}; // request_stop() and join()
@@ -554,7 +603,35 @@ void SaveDriverPipelineCacheNow() {
     }
 }
 
+namespace {
+bool Lbp3AsyncPipelines() {
+    static const bool value = [] {
+        const char* env = std::getenv("LBP3_ASYNC_PIPELINES");
+        return env && env[0] == '1' && !EmulatorSettings.IsShaderCollect();
+    }();
+    return value;
+}
+} // namespace
+
+std::atomic<u32> g_lbp3AsyncSkippedDraws{}; // draws skipped while their pipeline was building
+
+void PipelineCache::FinishAsyncBuilds() {
+    async_seen = async_done.load(std::memory_order_acquire);
+    std::erase_if(async_builds, [this](AsyncBuild& build) {
+        if (!build.pipeline->IsBuilt()) {
+            return false;
+        }
+        RegisterPipelineData(build.key, build.hash, build.sdata);
+        ++num_new_pipelines;
+        ++driver_cache_changes;
+        return true;
+    });
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    if (!async_builds.empty() && async_done.load(std::memory_order_acquire) != async_seen) {
+        FinishAsyncBuilds();
+    }
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         // LBP3 Recompiled (gap 15): every such draw used to vanish without a word. Count it, and
@@ -628,9 +705,22 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        const bool async = Lbp3AsyncPipelines();
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            runtime_infos, fetch_shader, modules, sdata, false, async);
+        if (async) {
+            // Registered for saving once it's built (FinishAsyncBuilds); skipped until then.
+            if (!build_workers) {
+                build_workers = std::make_unique<BuildWorkers>(async_done);
+            }
+            async_builds.push_back({graphics_key, pipeline_hash, sdata, it.value().get()});
+            build_workers->Submit(it.value().get());
+            ++g_lbp3PipelineCompiles;
+            g_lbp3PipelineCompileUs += Lbp3UsSince(lbp3_start);
+            ++g_lbp3AsyncSkippedDraws;
+            return nullptr;
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -647,7 +737,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
         }
     }
-    return it->second.get();
+    const GraphicsPipeline* pipeline = it->second.get();
+    if (pipeline && !pipeline->IsBuilt()) {
+        ++g_lbp3AsyncSkippedDraws;
+        return nullptr;
+    }
+    return pipeline;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {

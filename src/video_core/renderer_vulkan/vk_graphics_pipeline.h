@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <memory>
+
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -90,8 +94,17 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, bool deferred = false);
     ~GraphicsPipeline();
+
+    /// LBP3 Recompiled: background pipeline builds (LBP3_ASYNC_PIPELINES=1), ported from LBPPC
+    /// (emurphy04), GPL-2.0-or-later, commit 951fb8d. A deferred pipeline is set up on the GPU
+    /// thread (everything that reads guest state) and built by the driver later, on any thread
+    /// (BuildDeferred). Until then it isn't built, and the cache skips its draws.
+    void BuildDeferred();
+    bool IsBuilt() const noexcept {
+        return built.load(std::memory_order_acquire);
+    }
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -110,10 +123,19 @@ public:
 
 private:
     void BuildDescSetLayout(bool preloading);
+    void Build(vk::PipelineCache pipeline_cache, const SerializationSupport& sdata, bool clip_discard);
 
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    std::array<vk::ShaderModule, MaxShaderStages> stage_modules{}; ///< as passed in, for Build
+    struct DeferredBuild {
+        vk::PipelineCache pipeline_cache;
+        SerializationSupport sdata;
+        bool clip_discard;
+    };
+    std::unique_ptr<DeferredBuild> deferred_build;
+    std::atomic<bool> built{true};
 };
 
 struct ClipDistanceShaderKey {

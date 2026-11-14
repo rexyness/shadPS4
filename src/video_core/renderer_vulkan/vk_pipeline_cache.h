@@ -199,6 +199,24 @@ private:
     std::atomic<u32> driver_cache_changes{}; ///< pipelines made since the last save
     std::mutex driver_cache_mutex;
     std::jthread driver_cache_saver;
+
+    // LBP3 Recompiled: background pipeline builds (LBP3_ASYNC_PIPELINES=1), ported from LBPPC
+    // (emurphy04), GPL-2.0-or-later, commit 951fb8d. A new graphics pipeline is set up on the GPU
+    // thread and built by the driver on worker threads; its draws are skipped until it's ready (no
+    // freeze the first time something is drawn; it can appear a moment late instead). GPU thread
+    // only, except the counter.
+    struct AsyncBuild {
+        GraphicsPipelineKey key;
+        u64 hash;
+        GraphicsPipeline::SerializationSupport sdata;
+        GraphicsPipeline* pipeline;
+    };
+    std::vector<AsyncBuild> async_builds;
+    std::atomic<u32> async_done{};
+    u32 async_seen{};
+    void FinishAsyncBuilds();
+    struct BuildWorkers;
+    std::unique_ptr<BuildWorkers> build_workers; ///< last: stopped before anything else goes
 };
 
 // LBP3 Recompiled: saves the live PipelineCache's driver cache, if there is one with unsaved
