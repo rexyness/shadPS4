@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <thread>
 #include "common/lbp3_boot.h"
@@ -417,6 +418,25 @@ void PipelineCache::WarmUp() {
     if (const char* env = std::getenv("LBP3_PRELOAD_DELAY_US"); env && *env) {
         delay_us = std::min<u32>(u32(std::strtoul(env, nullptr, 10)), 100000u);
     }
+    // LBP3 Recompiled: when the loop below finds the files slow to read (a cold start: files not
+    // yet cached or scanned cost milliseconds each to open), the rest of the cache is read ahead
+    // on `threads` threads (DataBase::StartPrefetch; 11x faster than one at a time in a test).
+    // Warm starts read a pipeline in ~0.7 ms and never start it (it cost them 0.55 s). Checked
+    // every 128 pipelines: slower than 2 ms each starts it. Stopped and joined once the loop is
+    // done. LBP3_PRELOAD_PREFETCH=0: never; =1: from the start.
+    const char* prefetch_env = std::getenv("LBP3_PRELOAD_PREFETCH");
+    const int prefetch_mode =
+        !prefetch_env || !*prefetch_env ? 2 : (prefetch_env[0] == '0' ? 0 : 1);
+    std::vector<std::jthread> prefetch;
+    u32 prefetch_at = 0; // the pipeline count when it started
+    const auto start_prefetch = [&] {
+        prefetch = Storage::DataBase::Instance().StartPrefetch(std::max(threads, 2u));
+        prefetch_at = num_total_pipelines;
+    };
+    if (prefetch_mode == 1) {
+        start_prefetch();
+    }
+    auto window_start = std::chrono::steady_clock::now();
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
@@ -424,6 +444,13 @@ void PipelineCache::WarmUp() {
             Lbp3Boot::Step();
             if (delay_us) {
                 std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+            }
+            if (prefetch_mode == 2 && prefetch.empty() && num_total_pipelines % 128 == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - window_start > std::chrono::milliseconds(128 * 2)) {
+                    start_prefetch();
+                }
+                window_start = now;
             }
 
             Serialization::Archive ar{std::move(data)};
@@ -451,6 +478,13 @@ void PipelineCache::WarmUp() {
         });
 
     preload_jobs = nullptr;
+    if (!prefetch.empty()) {
+        std::fprintf(stderr,
+                     "[gpu] pipeline preload: slow reads, the cache was read ahead on %zu threads "
+                     "from pipeline %u on\n",
+                     prefetch.size(), prefetch_at);
+    }
+    prefetch.clear(); // stop and join the read-ahead threads before the builds start
     // Reading (keys, metas, SPIR-V, shader modules) is serial; with threads > 1 the pipelines
     // are built afterwards, else they were built while reading.
     const auto read_end = std::chrono::steady_clock::now();
