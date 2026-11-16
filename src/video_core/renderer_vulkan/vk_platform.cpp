@@ -66,7 +66,7 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
     if (window_info.type == Frontend::WindowSystemType::Windows) {
         const vk::Win32SurfaceCreateInfoKHR win32_ci = {
-            .hinstance = nullptr,
+            .hinstance = GetModuleHandleW(nullptr),
             .hwnd = static_cast<HWND>(window_info.render_surface),
         };
 
