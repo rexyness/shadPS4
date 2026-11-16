@@ -146,6 +146,9 @@ public:
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
+    /// Copies colour targets that lie whole rows inside a taller sampled image into those rows.
+    void GatherStackedTargets(ImageId image_id);
+
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 

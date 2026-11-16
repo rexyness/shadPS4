@@ -54,6 +54,7 @@ public:
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
+    void CopyIntoRows(VideoCore::Image* src, VideoCore::Image* dst, u32 dst_y);
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);
 

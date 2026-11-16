@@ -984,6 +984,72 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+// LBP3: the game draws its lights into 16 colour targets of 512x256, back to back in memory, then
+// samples that memory as one 512x4096 texture. On the PS4 that is one block of memory; here each
+// target is its own image, so the tall texture held memory the GPU never wrote and placed lights lit
+// nothing once the level had loaded. Each target lying whole rows inside a taller sampled image of
+// the same width, pitch and format, and holding what the GPU drew, is copied into those rows before
+// the texture is read. From LBPPC 0.1.4 (emurphy04, c333f27: GatherStackedTargets).
+// LBP3_STACKED_TARGETS=0: not copied (as before).
+void TextureCache::GatherStackedTargets(ImageId image_id) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LBP3_STACKED_TARGETS");
+        const bool on = !(v && v[0] == '0');
+        if (!on) {
+            std::fprintf(stderr, "[gpu] stacked targets: off (LBP3_STACKED_TARGETS=0)\n");
+        }
+        return on;
+    }();
+    if (!enabled) {
+        return;
+    }
+    Image& image = slot_images[image_id];
+    const ImageInfo& info = image.info;
+    if (info.props.is_depth || info.props.is_block || info.type != AmdGpu::ImageType::Color2D ||
+        info.resources.levels != 1 || info.resources.layers != 1 || info.num_samples != 1 ||
+        info.guest_address == 0) {
+        return;
+    }
+    const u64 row_bytes = u64(info.pitch) * info.num_bits / 8;
+    if (row_bytes == 0) {
+        return;
+    }
+    SmallVector<std::pair<ImageId, u32>, 16> parts;
+    ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId part_id, Image& part) {
+        const ImageInfo& p = part.info;
+        if (part_id == image_id || p.guest_address < info.guest_address ||
+            p.size.width != info.size.width || p.pitch != info.pitch ||
+            p.size.height >= info.size.height || p.pixel_format != info.pixel_format ||
+            p.type != info.type || p.resources.levels != 1 || p.resources.layers != 1 ||
+            p.num_samples != 1 || p.props.is_depth || !part.SafeToDownload()) {
+            return;
+        }
+        const u64 offset = p.guest_address - info.guest_address;
+        if (offset % row_bytes != 0) {
+            return;
+        }
+        const u64 y = offset / row_bytes;
+        if (y + p.size.height > info.size.height ||
+            ((info.props.is_tiled || p.props.is_tiled) && y % 8 != 0)) {
+            return;
+        }
+        parts.emplace_back(part_id, static_cast<u32>(y));
+    });
+    if (parts.size() < 2) {
+        return;
+    }
+    const ImageInfo& first = slot_images[parts[0].first].info;
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "[gpu] stacked targets: %zu targets of %ux%u copied into the %ux%u texture at %#llx",
+                  parts.size(), first.size.width, first.size.height, info.size.width,
+                  info.size.height, static_cast<unsigned long long>(info.guest_address));
+    Lbp3LogOnce(info.guest_address * 977 + parts.size(), line);
+    for (const auto& [part_id, y] : parts) {
+        runtime.CopyIntoRows(&slot_images[part_id], &image, y);
+    }
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
@@ -995,6 +1061,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    if (desc.type != BindingType::Storage) {
+        GatherStackedTargets(image_id);
+    }
     return image.FindView(desc.view_info);
 }
 

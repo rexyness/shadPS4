@@ -433,6 +433,47 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+// LBP3: the whole of src (its first mip and layer) into dst's first mip and layer from row dst_y
+// (TextureCache::GatherStackedTargets). From LBPPC 0.1.4 (emurphy04, c333f27).
+void Runtime::CopyIntoRows(VideoCore::Image* src, VideoCore::Image* dst, u32 dst_y) {
+    const vk::ImageCopy image_copy{
+        .srcSubresource{
+            .aspectMask = src->aspect_mask,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .dstSubresource{
+            .aspectMask = dst->aspect_mask,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .dstOffset = {0, static_cast<s32>(dst_y), 0},
+        .extent = {src->info.size.width, src->info.size.height, 1},
+    };
+
+    SetBackingSamples(dst, dst->info.num_samples);
+    SetBackingSamples(src, src->info.num_samples);
+
+    scheduler.EndRendering();
+
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
+                     vk::ImageLayout::eTransferDstOptimal, image_copy);
+
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+}
+
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
         if ((instance.IsMaintenance8Supported() ||
