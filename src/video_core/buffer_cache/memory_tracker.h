@@ -55,6 +55,15 @@ public:
         });
     }
 
+    /// LBP3: see RegionManager::ExtendWriteFault. Returns the pages it unprotected.
+    u64 ExtendWriteFault(VAddr window_addr, u64 size) {
+        u64 pages = 0;
+        IteratePages(window_addr, size, [&pages](RegionManager* manager, u64 offset, u64 size) {
+            pages += manager->ExtendWriteFault(offset, size);
+        });
+        return pages;
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {

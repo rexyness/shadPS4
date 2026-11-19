@@ -78,6 +78,10 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
+    /// LBP3: after a guest write fault, the window around it (LBP3_FAULT_WINDOW, default 256 KiB;
+    /// buffer_cache.cpp).
+    void ExtendWriteFault(VAddr device_addr);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 

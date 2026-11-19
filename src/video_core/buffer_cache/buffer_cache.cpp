@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -93,6 +96,34 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+}
+
+// LBP3: guest write faults, and the pages ExtendWriteFault unprotected ahead (the [faults] line).
+std::atomic<u64> g_lbp3WriteFaults{}, g_lbp3WindowPages{};
+
+u32 Lbp3FaultWindowKib() {
+    static const u32 kib = [] {
+        const char* env = std::getenv("LBP3_FAULT_WINDOW");
+        const u64 v = env && *env ? std::strtoull(env, nullptr, 10) : 256;
+        return v < 8 ? 0u : static_cast<u32>(std::bit_ceil(std::min<u64>(v, 1024)));
+    }();
+    return kib;
+}
+
+void BufferCache::ExtendWriteFault(VAddr device_addr) {
+    // LBP3_FAULT_WINDOW=<KiB> (8-1024, a power of two; default 256, 0 = off): a guest write fault
+    // also unprotects the clean, buffer-tracked pages of the aligned window around it, so a job
+    // that fills a buffer page by page faults once per window instead of once per page
+    // (perf/gfx_wait.md fix 2). sethlikepie's (littlebigplanet3-pc 07cc7e7, buffer_cache.cpp, 256
+    // there too). Measured on the warm Needlepoint route (perf/seth_ports.md, fa1): write faults
+    // per status window 18,187-18,703 -> 2,582-2,586; graphics blocked 0.25-0.26 -> 0.13-0.14 ms
+    // a frame (worst window 3.3-3.5 -> 2.3 ms); re-uploads unchanged (~26 MB a frame).
+    const u64 window = u64{Lbp3FaultWindowKib()} * 1024;
+    if (window <= BYTES_PER_PAGE) {
+        return;
+    }
+    g_lbp3WindowPages.fetch_add(memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window),
+                                std::memory_order_relaxed);
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {

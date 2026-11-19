@@ -37,6 +37,9 @@
 
 namespace VideoCore {
 
+extern std::atomic<u64> g_lbp3WriteFaults; // buffer_cache.cpp: the [faults] line
+u32 Lbp3FaultWindowKib();                 // buffer_cache.cpp: LBP3_FAULT_WINDOW, 0 = off
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
@@ -437,7 +440,14 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            g_lbp3WriteFaults.fetch_add(1, std::memory_order_relaxed);
+            const bool handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            // LBP3: the window around it (LBP3_FAULT_WINDOW, 256 KiB by default); guest threads
+            // only, as the GPU thread may hold the cache's locks here.
+            if (handled && !is_gpu_thread && Lbp3FaultWindowKib()) {
+                rasterizer->ExtendWriteFault(addr);
+            }
+            return handled;
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

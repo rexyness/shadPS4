@@ -85,6 +85,11 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// LBP3: a guest thread's write fault at addr was handled; unprotect the window around it
+    /// too (LBP3_FAULT_WINDOW, BufferCache::ExtendWriteFault).
+    void ExtendWriteFault(VAddr addr) {
+        buffer_cache.ExtendWriteFault(addr);
+    }
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);

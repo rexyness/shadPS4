@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
@@ -160,6 +161,37 @@ public:
         if constexpr (locked) {
             mutex.unlock();
         }
+    }
+
+    /// LBP3: after a guest write fault, marks the other CPU-protected pages of the window as
+    /// CPU-modified too (so they are unprotected now and re-uploaded at their next GPU use),
+    /// except pages holding GPU-modified data, whose arena copy may be newer than guest memory.
+    /// Returns how many pages it unprotected. sethlikepie's ExtendWriteFault (littlebigplanet3-pc
+    /// 07cc7e7, buffer_cache/region_manager.h, GPL-2.0-or-later).
+    u64 ExtendWriteFault(u64 offset, u64 size) {
+        const auto bounds = GetBounds(offset, size);
+        bool update_watchers{};
+        RegionBits write_prot;
+        RegionBits read_prot;
+        Bounds watcher_bounds = MIN_BOUNDS;
+        u64 pages = 0;
+        std::scoped_lock lk{mutex};
+        IterateWords(bounds, [&](u64 index, u64 mask) {
+            const u64 cpu_mask = mask & ~gpu[index];
+            if (UpdateProtection<StateOp::Set, StateOp::None>(write_prot, read_prot, watcher_bounds,
+                                                              index, cpu_mask)) {
+                update_watchers = true;
+                pages += std::popcount(write_prot[index]);
+            }
+        });
+        if (update_watchers) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                 GetPageOp<Type::CPU>(StateOp::Set), PageOp::None);
+        }
+        IterateWords(bounds, [&](u64 index, u64 mask) {
+            UpdateState<StateOp::Set, StateOp::None>(index, mask & ~gpu[index]);
+        });
+        return pages;
     }
 
     template <Type type>
