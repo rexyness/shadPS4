@@ -614,6 +614,137 @@ bool Lbp3AsyncPipelines() {
 } // namespace
 
 std::atomic<u32> g_lbp3AsyncSkippedDraws{}; // draws skipped while their pipeline was building
+std::atomic<u32> g_lbp3AsyncWaitedDraws{};  // draws that waited for theirs (AsyncPolicyWaits)
+std::atomic<u64> g_lbp3AsyncWaitUs{};       // and how long (built at once, or a queued build)
+extern std::atomic<u64> g_lbp3GpuFrames;     // vk_rasterizer.cpp: guest submits, one a game frame
+
+} // namespace Vulkan
+namespace VideoCore {
+extern std::atomic<const volatile u8*> g_lbp3CaptureQueued; // texture_cache.cpp
+}
+namespace Vulkan {
+
+namespace {
+// LBP3: background pipeline builds skip a draw until its pipeline is built (LBP3_ASYNC_PIPELINES).
+// Some draws must not go missing, so they wait for theirs instead. sethlikepie's policy
+// (littlebigplanet3-pc 07cc7e7, vk_pipeline_cache.cpp F110 BAKEWAIT and vk_rasterizer.cpp F111
+// THUMBWAIT; the tiers are bbport 0.5's), LBP3_ASYNC_POLICY:
+//  perframe (default) full-screen passes (12 indices or fewer: lighting, fog, post) and indirect
+//           draws wait; so does every draw in a frame after one of under 300 draws (loading
+//           screens, menus), and every draw into a render target not drawn in each of the last
+//           LBP3_ASYNC_STREAK (2) frames: a one-time render. Skipping those left, in their LBP3 runs,
+//           the Pod's decoration as bare cardboard after some boots (a texture baked once, never
+//           redrawn); in ours, on a cold cache, the poster reflected in the Pod's right window.
+//  geometry full-screen and indirect draws only;
+//  all      every draw may be skipped (as before this policy).
+// In every policy, every draw waits while the game has a photo or thumbnail capture queued (its
+// "capture queued" byte, g_lbp3CaptureQueued): a saved picture must have everything in it.
+enum class AsyncPolicy { All, Geometry, PerFrame };
+
+AsyncPolicy GetAsyncPolicy() {
+    static const AsyncPolicy policy = [] {
+        const char* env = std::getenv("LBP3_ASYNC_POLICY");
+        const std::string value = env ? env : "";
+        const AsyncPolicy p = value == "all"        ? AsyncPolicy::All
+                              : value == "geometry" ? AsyncPolicy::Geometry
+                                                    : AsyncPolicy::PerFrame;
+        std::fprintf(stderr,
+                     "[gpu] background pipeline builds: %s wait for their pipeline, and every draw "
+                     "while a photo or thumbnail is captured (LBP3_ASYNC_POLICY=%s)\n",
+                     p == AsyncPolicy::All        ? "no draws"
+                     : p == AsyncPolicy::Geometry ? "full-screen and indirect draws"
+                                                  : "full-screen, indirect, loading-screen and one-time draws",
+                     p == AsyncPolicy::All ? "all" : p == AsyncPolicy::Geometry ? "geometry" : "perframe");
+        return p;
+    }();
+    return policy;
+}
+
+// The draw's render target: its first colour buffer written, else its depth buffer, else 0.
+u64 DrawTarget(const AmdGpu::Regs& regs) {
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            if (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) {
+                return regs.color_buffers[cb].Address();
+            }
+        }
+    }
+    return regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthAddress() : 0;
+}
+} // namespace
+
+void PipelineCache::NoteAsyncDraw() {
+    const u64 frame = g_lbp3GpuFrames.load(std::memory_order_relaxed);
+    if (frame != policy_frame) {
+        policy_last_frame_draws = policy_frame_draws;
+        policy_frame_draws = 0;
+        policy_frame = frame;
+    }
+    ++policy_frame_draws;
+    if (GetAsyncPolicy() != AsyncPolicy::PerFrame) {
+        return;
+    }
+    // Frames in a row each target is drawn to, counted once per frame and target.
+    const u64 target = DrawTarget(liverpool->regs);
+    if (target == 0 || (target == streak_target && frame == streak_frame)) {
+        return;
+    }
+    streak_target = target;
+    streak_frame = frame;
+    if (target_streaks.size() > 4096) { // targets of long ago: count again
+        target_streaks.clear();
+    }
+    auto& streak = target_streaks[target];
+    if (streak.last_frame != frame) {
+        streak.frames = streak.last_frame + 1 == frame ? streak.frames + 1 : 1;
+        streak.last_frame = frame;
+    }
+}
+
+bool PipelineCache::AsyncPolicyWaits(bool indirect) const {
+    if (const volatile u8* capture =
+            VideoCore::g_lbp3CaptureQueued.load(std::memory_order_relaxed);
+        capture && *capture != 0) {
+        return true;
+    }
+    const AsyncPolicy policy = GetAsyncPolicy();
+    if (policy == AsyncPolicy::All) {
+        return false;
+    }
+    const auto& regs = liverpool->regs;
+    constexpr u32 FullScreenIndices = 12;
+    if (indirect || regs.num_indices <= FullScreenIndices) {
+        return true;
+    }
+    if (policy != AsyncPolicy::PerFrame) {
+        return false;
+    }
+    // LBP3_ASYNC_MIN_DRAWS (a frame under it is a loading screen or menu; sethlikepie's 300) and
+    // LBP3_ASYNC_STREAK (frames in a row a target must have been drawn to count as drawn every
+    // frame). sethlikepie's streak is 8; ours is 2: a one-time render is drawn in a single frame,
+    // and at 8 every target of a level just entered counted as one-time for 8 frames, which is when
+    // most new pipelines come. Cold Needlepoint route (perf/seth_ports.md, sa4): streak 8 waited
+    // 14.3 s with 11 frames over 40 ms in the walk; streak 2 13.0 s, all of it outside the walk
+    // (0 over 40 ms there). Both draw the Pod window's reflected poster, which "all" loses.
+    static const u64 min_draws = [] {
+        const char* env = std::getenv("LBP3_ASYNC_MIN_DRAWS");
+        return env && *env ? std::strtoull(env, nullptr, 10) : u64{300};
+    }();
+    static const u32 per_frame_streak = [] {
+        const char* env = std::getenv("LBP3_ASYNC_STREAK");
+        const u32 v = env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 2u;
+        std::fprintf(stderr, "[gpu] background pipeline builds: a target drawn %u frames in a row is drawn every frame; "
+                             "a frame of under %llu draws is a loading screen (LBP3_ASYNC_STREAK, LBP3_ASYNC_MIN_DRAWS)\n",
+                     v, static_cast<unsigned long long>(min_draws));
+        return v;
+    }();
+    if (policy_last_frame_draws < min_draws) {
+        return true;
+    }
+    const u64 target = DrawTarget(regs);
+    const auto streak = target_streaks.find(target);
+    return target == 0 || streak == target_streaks.end() || streak->second.frames < per_frame_streak;
+}
 
 void PipelineCache::FinishAsyncBuilds() {
     async_seen = async_done.load(std::memory_order_acquire);
@@ -628,9 +759,14 @@ void PipelineCache::FinishAsyncBuilds() {
     });
 }
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
+                                                           bool indirect) {
     if (!async_builds.empty() && async_done.load(std::memory_order_acquire) != async_seen) {
         FinishAsyncBuilds();
+    }
+    const bool async = Lbp3AsyncPipelines();
+    if (async) {
+        NoteAsyncDraw();
     }
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
@@ -705,11 +841,17 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
-        const bool async = Lbp3AsyncPipelines();
+        // A draw the wait policy keeps is built here at once, as without background builds.
+        const bool waits = async && AsyncPolicyWaits(indirect);
+        const bool deferred = async && !waits;
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false, async);
-        if (async) {
+            runtime_infos, fetch_shader, modules, sdata, false, deferred);
+        if (waits) {
+            ++g_lbp3AsyncWaitedDraws;
+            g_lbp3AsyncWaitUs += Lbp3UsSince(lbp3_start);
+        }
+        if (deferred) {
             // Registered for saving once it's built (FinishAsyncBuilds); skipped until then.
             if (!build_workers) {
                 build_workers = std::make_unique<BuildWorkers>(async_done);
@@ -739,8 +881,15 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     const GraphicsPipeline* pipeline = it->second.get();
     if (pipeline && !pipeline->IsBuilt()) {
-        ++g_lbp3AsyncSkippedDraws;
-        return nullptr;
+        if (!AsyncPolicyWaits(indirect)) {
+            ++g_lbp3AsyncSkippedDraws;
+            return nullptr;
+        }
+        // Queued for a worker already: this draw waits for it (the policy).
+        const auto lbp3_wait = std::chrono::steady_clock::now();
+        pipeline->WaitBuilt();
+        ++g_lbp3AsyncWaitedDraws;
+        g_lbp3AsyncWaitUs += Lbp3UsSince(lbp3_wait);
     }
     return pipeline;
 }

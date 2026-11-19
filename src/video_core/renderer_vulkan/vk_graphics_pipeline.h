@@ -105,6 +105,10 @@ public:
     bool IsBuilt() const noexcept {
         return built.load(std::memory_order_acquire);
     }
+    /// LBP3: blocks until a deferred build is done (a draw the async wait policy keeps).
+    void WaitBuilt() const noexcept {
+        built.wait(false, std::memory_order_acquire);
+    }
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;

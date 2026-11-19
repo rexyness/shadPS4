@@ -94,7 +94,8 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
+                                                bool indirect = false);
 
     const ComputePipeline* GetComputePipeline();
 
@@ -215,6 +216,18 @@ private:
     std::atomic<u32> async_done{};
     u32 async_seen{};
     void FinishAsyncBuilds();
+    // LBP3: which draws wait for their pipeline instead (LBP3_ASYNC_POLICY, AsyncPolicyWaits):
+    // the draw counts per frame and how many frames in a row each render target is drawn to.
+    // sethlikepie's policy (littlebigplanet3-pc 07cc7e7, F110/F111, from bbport 0.5).
+    struct TargetStreak {
+        u64 last_frame = ~0ull;
+        u32 frames = 0;
+    };
+    tsl::robin_map<u64, TargetStreak> target_streaks;
+    u64 streak_target{}, streak_frame{~0ull};
+    u64 policy_frame{~0ull}, policy_frame_draws{}, policy_last_frame_draws{};
+    void NoteAsyncDraw();
+    bool AsyncPolicyWaits(bool indirect) const;
     struct BuildWorkers;
     std::unique_ptr<BuildWorkers> build_workers; ///< last: stopped before anything else goes
 };

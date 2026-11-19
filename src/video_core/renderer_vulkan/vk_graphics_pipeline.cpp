@@ -124,6 +124,7 @@ void GraphicsPipeline::BuildDeferred() {
         deferred_build.reset();
     }
     built.store(true, std::memory_order_release);
+    built.notify_all(); // LBP3: WaitBuilt
 }
 
 // The driver's part: everything from here reads only the key, the kept stages and modules and

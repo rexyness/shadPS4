@@ -460,7 +460,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
     };
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params, true);
     if (!pipeline) {
         return;
     }
@@ -644,6 +644,11 @@ u64 Rasterizer::Flush() {
 void Rasterizer::Finish() {
     scheduler.Finish();
 }
+
+// LBP3: frames the GPU thread has reached the flip of (the background builds' wait policy counts
+// frames by it). Ticked by the runtime's flip interrupt (hle/videoout.cpp), not OnSubmit: LBP3
+// never calls sceGnmSubmitDone, so OnSubmit never runs in this port.
+std::atomic<u64> g_lbp3GpuFrames{};
 
 void Rasterizer::OnSubmit() {
     buffer_cache.TickFrame();
