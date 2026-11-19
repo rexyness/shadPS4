@@ -368,7 +368,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     const bool bpp_match = requested_info.num_bits == cache_image.info.num_bits;
 
     // If an image in the cache has less slices we need to expand it
-    bool recreate = cache_image.info.resources < requested_info.resources;
+    bool recreate = !cache_image.info.resources.Contains(requested_info.resources);  // sgdc3 80ffa53
 
     switch (binding) {
     case BindingType::Texture:
@@ -496,7 +496,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
+            !cache_image.info.resources.Contains(image_info.resources)) {  // sgdc3 80ffa53
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -917,7 +917,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources &&
+        } else if (!image_resolved.info.resources.Contains(info.resources) &&  // sgdc3 80ffa53
                    !(image_resolved.info.props.is_volume && !info.props.is_volume &&
                      image_resolved.info.size.width == info.size.width &&
                      image_resolved.info.size.height == info.size.height &&

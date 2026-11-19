@@ -65,6 +65,14 @@ struct SubresourceExtent {
     u16 layers = 1;
 
     auto operator<=>(const SubresourceExtent&) const = default;
+
+    /// True if an image with this extent can serve every subresource of `other`. The defaulted
+    /// operators compare levels first and layers only on a tie, which can't answer that: an image
+    /// with more mips but fewer layers counted as big enough. (sgdc3 80ffa53, via sethlikepie's
+    /// littlebigplanet3-pc 07cc7e7.)
+    bool Contains(const SubresourceExtent& other) const noexcept {
+        return levels >= other.levels && layers >= other.layers;
+    }
 };
 
 struct SubresourceRange {
