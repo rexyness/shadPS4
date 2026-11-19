@@ -1174,8 +1174,9 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         const std::array<float, 4> remapped = format_remap.Apply(before);
         static std::atomic<int> logged{0};
         if (remapped != before && logged.fetch_add(1) < 3) {
-            LOG_INFO(Render_Vulkan, "clear value of a {} colour buffer remapped to the Vulkan format's channel order",
-                     format);
+            // A warning, not info: only warnings reach the game log.
+            LOG_WARNING(Render_Vulkan, "clear value of a {} colour buffer remapped to the Vulkan format's channel order",
+                        format);
         }
         color.float32 = remapped;
     }
