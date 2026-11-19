@@ -6,6 +6,7 @@
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
+#include <atomic>
 #include <magic_enum/magic_enum.hpp>
 
 #define INVALID_NUMBER_FORMAT_COMBO                                                                \
@@ -834,8 +835,10 @@ vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat
 }
 
 vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
-    const auto comp_swizzle = color_buffer.Swizzle();
     const auto format = AmdGpu::DataFormat(color_buffer.info.format);
+    // Only the channel order our own Vulkan format choice implies (1_5_5_5, 11_11_10, 10_10_10_2,
+    // 4_4_4_4; identity for the rest), not the buffer's comp_swap (sgdc3 2966581).
+    const auto format_remap = AmdGpu::RemapSwizzle(format, AmdGpu::IdentityMapping);
     const auto number_type = color_buffer.GetFixedNumberFormat();
 
     const auto& c0 = color_buffer.clear_word0;
@@ -1161,9 +1164,21 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
     }
 
     // The clear word is already in the colour buffer's channel order (the order its comp_swap
-    // gives), so it is not swizzled again: LBP3's Create sky (comp_swap Alternate) came out with
-    // red and blue swapped.
-    (void)comp_swizzle;
+    // gives), so its comp_swap is not applied again: LBP3's Create sky (comp_swap Alternate) came
+    // out with red and blue swapped. The packed formats whose Vulkan format stores the channels in
+    // another order still need that remap, as their draws get it (sgdc3 2966581, via
+    // sethlikepie's littlebigplanet3-pc 07cc7e7).
+    if (!(format_remap == AmdGpu::IdentityMapping)) {
+        const std::array<float, 4> before{color.float32[0], color.float32[1], color.float32[2],
+                                          color.float32[3]};
+        const std::array<float, 4> remapped = format_remap.Apply(before);
+        static std::atomic<int> logged{0};
+        if (remapped != before && logged.fetch_add(1) < 3) {
+            LOG_INFO(Render_Vulkan, "clear value of a {} colour buffer remapped to the Vulkan format's channel order",
+                     format);
+        }
+        color.float32 = remapped;
+    }
     return {.color = color};
 }
 
