@@ -230,6 +230,9 @@ public:
     void V_RCP_LEGACY_F32(const GcnInst& inst);
     void V_RCP_F64(const GcnInst& inst);
     void V_RSQ_F32(const GcnInst& inst);
+    void V_RCP_CLAMP_F32(const GcnInst& inst); // LBP3 (sgdc3 eb51f01)
+    void V_RSQ_CLAMP_F32(const GcnInst& inst);
+    IR::F32 FPClampInfToMax(const IR::F32& value);
     void V_SQRT_F32(const GcnInst& inst);
     void V_SIN_F32(const GcnInst& inst);
     void V_COS_F32(const GcnInst& inst);

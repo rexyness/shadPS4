@@ -21,7 +21,10 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u;
+// LBP3: 8 = v_rsq_clamp/v_rcp_clamp clamp to FLT_MAX and v_writelane_b32 writes one lane (sgdc3
+// eb51f01), and s_and_b64 exec opens an exec scope (sethlikepie's F91): nearly every LBP3 shader
+// translates differently, so a warm cache must not keep the old SPIR-V (sgdc3 174a8f4's rule).
+static constexpr u32 ShaderBinaryVersion = 8u;
 static constexpr u32 ShaderMetaVersion = 6u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

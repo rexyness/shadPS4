@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -159,8 +161,33 @@ void CFG::EmitLabels() {
     std::ranges::sort(labels);
 }
 
+// LBP3 (sethlikepie's F91, littlebigplanet3-pc 07cc7e7, GPL-2.0-or-later): a plain S_AND_B64 that
+// writes EXEC ("s_and_b64 exec, s[0:1], s[4:5]" after a VOPC into SGPRs, the old mask kept in
+// s[0:1] and put back by "s_mov_b64 exec, s[0:1]") narrows EXEC like S_ANDN2_B64. Upstream opens a
+// scope only on SAVEEXEC/ANDN2/CMPX, so the VALU code after it ran unmasked: in their LBP3 runs the
+// power-up wheel's pixel shader 79f2fc54712620a3 lost the sign of its angle. It opens a scope and
+// closes the one before it. S_WQM_B64 EXEC closes a scope opened this way, so the discard sequence
+// "s_and_b64 exec, exec, s[live]; s_wqm_b64 exec, exec" (most pixel shaders) gets none: WQM widens
+// EXEC back to whole quads. 53,549 of LBP3's shaders have the non-discard form, 284 in our play
+// cache (opcode_scan.py). LBP3_F91=0 turns it off; that needs an empty LBP3_SHADER_CACHE_DIR, as
+// the cache keeps the translation.
+static bool Lbp3AndExecScopes() {
+    static const bool on = [] {
+        const char* env = std::getenv("LBP3_F91");
+        const bool v = !(env && env[0] == '0');
+        std::fprintf(stderr, "[shaders] s_and_b64 exec opens an exec scope: %s (LBP3_F91)\n", v ? "on" : "off");
+        return v;
+    }();
+    return on;
+}
+
 void CFG::SplitDivergenceScopes() {
-    const auto is_open_scope = [](const GcnInst& inst) {
+    const bool and_exec = Lbp3AndExecScopes();
+    const auto is_and_exec = [and_exec](const GcnInst& inst) {
+        return and_exec && inst.opcode == Opcode::S_AND_B64 &&
+               inst.dst[0].field == OperandField::ExecLo;
+    };
+    const auto is_open_scope = [&](const GcnInst& inst) {
         // An open scope instruction is an instruction that modifies EXEC
         // but also saves the previous value to restore later. This indicates
         // we are entering a scope.
@@ -169,9 +196,13 @@ void CFG::SplitDivergenceScopes() {
                // with SAVEEXEC to mask the threads that didn't pass the condition
                // of initial branch.
                (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
-               inst.IsCmpx();
+               is_and_exec(inst) || inst.IsCmpx();
     };
-    const auto is_close_scope = [](const GcnInst& inst) {
+    bool and_scope = false; // LBP3: the open scope was started by an S_AND_B64 EXEC
+    const auto is_wqm_exec = [](const GcnInst& inst) {
+        return inst.opcode == Opcode::S_WQM_B64 && inst.dst[0].field == OperandField::ExecLo;
+    };
+    const auto is_close_scope = [&](const GcnInst& inst) {
         // Closing an EXEC scope can be either a branch instruction
         // (typical case when S_AND_SAVEEXEC_B64 is right before a branch)
         // or by a move instruction to EXEC that restores the backup.
@@ -180,12 +211,14 @@ void CFG::SplitDivergenceScopes() {
                // Those instructions need to be wrapped in the condition as well so allow branch
                // as end scope instruction.
                inst.opcode == Opcode::S_CBRANCH_EXECZ || inst.opcode == Opcode::S_ENDPGM ||
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo);
+               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
+               is_and_exec(inst) || (and_scope && is_wqm_exec(inst));
     };
 
     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
         auto next_blk = std::next(blk);
         s32 curr_begin = -1;
+        and_scope = false;
         for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
             const auto& inst = inst_list[index];
             const bool is_close = is_close_scope(inst);
@@ -193,6 +226,7 @@ void CFG::SplitDivergenceScopes() {
                 // If there are no instructions inside scope don't do anything.
                 if (index - curr_begin == 1 && is_close) {
                     curr_begin = is_open_scope(inst) ? static_cast<s32>(index) : -1;
+                    and_scope = curr_begin != -1 && is_and_exec(inst);
                     continue;
                 }
                 // If all instructions in the scope ignore exec masking, we shouldn't insert a
@@ -271,10 +305,12 @@ void CFG::SplitDivergenceScopes() {
                 }
                 // Reset scope begin.
                 curr_begin = -1;
+                and_scope = false;
             }
             // Mark a potential start of an exec scope.
             if (is_open_scope(inst)) {
                 curr_begin = index;
+                and_scope = is_and_exec(inst);
             }
         }
     }
