@@ -246,6 +246,14 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // These are shared by every preloaded pipeline, and the early returns below (a missing meta
+    // blob, a stage that fails to load) leave the previous pipeline's stages and fetch shader
+    // behind for the next one: clear them on entry. (sgdc3 7184f52, via sethlikepie's
+    // littlebigplanet3-pc 07cc7e7.)
+    fetch_shader = nullptr;
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
