@@ -629,25 +629,29 @@ namespace {
 // Some draws must not go missing, so they wait for theirs instead. sethlikepie's policy
 // (littlebigplanet3-pc 07cc7e7, vk_pipeline_cache.cpp F110 BAKEWAIT and vk_rasterizer.cpp F111
 // THUMBWAIT; the tiers are bbport 0.5's), LBP3_ASYNC_POLICY:
-//  perframe (default) full-screen passes (12 indices or fewer: lighting, fog, post) and indirect
-//           draws wait; so does every draw in a frame after one of under 300 draws (loading
-//           screens, menus), and every draw into a render target not drawn in each of the last
-//           LBP3_ASYNC_STREAK (2) frames: a one-time render. Skipping those left, in their LBP3 runs,
-//           the Pod's decoration as bare cardboard after some boots (a texture baked once, never
-//           redrawn); in ours, on a cold cache, the poster reflected in the Pod's right window.
-//  geometry full-screen and indirect draws only;
-//  all      every draw may be skipped (as before this policy).
+//  all      (default) every other draw may be skipped, as before this policy;
+//  perframe full-screen passes (12 indices or fewer: lighting, fog, post) and indirect draws wait;
+//           so does every draw in a frame after one of under 300 draws (loading screens, menus), and
+//           every draw into a render target not drawn in each of the last LBP3_ASYNC_STREAK (2)
+//           frames: a one-time render. Skipping those left, in their LBP3 runs, the Pod's decoration
+//           as bare cardboard after some boots (a texture baked once, never redrawn); in ours, on a
+//           cold cache, the poster reflected in the Pod's right window (sa3, sa4);
+//  geometry full-screen and indirect draws only (also drew the poster in sa4).
 // In every policy, every draw waits while the game has a photo or thumbnail capture queued (its
 // "capture queued" byte, g_lbp3CaptureQueued): a saved picture must have everything in it.
+// "all" stays the default: background builds are on by default online to stop first-time freezes
+// in play, and on the cold Needlepoint route perframe waited ~5 s around the first Pod frames,
+// 6.2 s in one window of the menus before the level, and up to 0.6 s at the level's start
+// (perf/seth_ports.md, sa4). Which way to go is the user's call.
 enum class AsyncPolicy { All, Geometry, PerFrame };
 
 AsyncPolicy GetAsyncPolicy() {
     static const AsyncPolicy policy = [] {
         const char* env = std::getenv("LBP3_ASYNC_POLICY");
         const std::string value = env ? env : "";
-        const AsyncPolicy p = value == "all"        ? AsyncPolicy::All
+        const AsyncPolicy p = value == "perframe"   ? AsyncPolicy::PerFrame
                               : value == "geometry" ? AsyncPolicy::Geometry
-                                                    : AsyncPolicy::PerFrame;
+                                                    : AsyncPolicy::All;
         std::fprintf(stderr,
                      "[gpu] background pipeline builds: %s wait for their pipeline, and every draw "
                      "while a photo or thumbnail is captured (LBP3_ASYNC_POLICY=%s)\n",
