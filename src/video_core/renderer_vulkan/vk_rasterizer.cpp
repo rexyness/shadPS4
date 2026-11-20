@@ -337,6 +337,7 @@ void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices) = nullptr;
 void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full) = nullptr;
 bool (*g_lbp3ViewportJitter)(float width, float height, float* dx, float* dy) = nullptr;
 bool (*g_lbp3SkipDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices) = nullptr;
+float (*g_lbp3SamplerBias)() = nullptr;
 
 void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
@@ -1283,6 +1284,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(ssharp.border_color_type.Value()),
                         liverpool->regs.ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
+        }
+        // LBP3 DLSS: the 3D scene's textures sampled sharper while DLSS upscales (vk_rasterizer.h).
+        // The bias goes into this copy of the S#, so the biased sampler is cached on its own.
+        if (g_lbp3SamplerBias && stage.hw_stage == Shader::HwStage::Fragment) {
+            const float bias = g_lbp3SamplerBias();
+            if (bias != 0.f) {
+                const s32 raw = s32(std::lround((ssharp.LodBias() + bias) * 256.f));
+                ssharp.lod_bias.Assign(u64(std::clamp(raw, -8192, 8191)) & 0x3fffu);
+            }
         }
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);

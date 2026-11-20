@@ -36,6 +36,9 @@ extern void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full
 // SMAA copy-back while DLSS anti-aliases instead).
 extern bool (*g_lbp3ViewportJitter)(float width, float height, float* dx, float* dy);
 extern bool (*g_lbp3SkipDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices);
+// SamplerBias: asked per sampler a draw's pixel shader binds; a non-zero value is added to its LOD
+// bias (the 3D scene's textures sampled sharper while DLSS upscales). Never asked for compute.
+extern float (*g_lbp3SamplerBias)();
 
 class GraphicsPipeline;
 class Runtime;
