@@ -4,7 +4,9 @@
 #pragma once
 
 #include <span>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -18,6 +20,13 @@ class WindowSDL;
 VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
+
+// LBP3 port: extensions a runtime add-on needs besides shadPS4's own (the DLSS upscaler of a
+// DLSS build). Null unless the runtime sets them before the Instance is created; unavailable
+// names are left out, as shadPS4's own optional extensions are.
+extern std::vector<std::string> (*g_lbp3ExtraInstanceExtensions)();
+extern std::vector<std::string> (*g_lbp3ExtraDeviceExtensions)(VkInstance instance,
+                                                                VkPhysicalDevice physical_device);
 
 class Instance {
 public:

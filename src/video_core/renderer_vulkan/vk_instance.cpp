@@ -18,6 +18,9 @@
 
 namespace Vulkan {
 
+std::vector<std::string> (*g_lbp3ExtraInstanceExtensions)() = nullptr;
+std::vector<std::string> (*g_lbp3ExtraDeviceExtensions)(VkInstance, VkPhysicalDevice) = nullptr;
+
 namespace {
 
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
@@ -229,7 +232,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;  // LBP3: room for add-ons
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -360,6 +363,20 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+
+    // LBP3 port: a runtime add-on's device extensions (vk_instance.h), unless already enabled.
+    static std::vector<std::string> lbp3_extra;
+    if (g_lbp3ExtraDeviceExtensions) {
+        lbp3_extra = g_lbp3ExtraDeviceExtensions(static_cast<VkInstance>(*instance),
+                                                 static_cast<VkPhysicalDevice>(physical_device));
+        for (const std::string& name : lbp3_extra) {
+            if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                             [&](const char* e) { return name == e; }) &&
+                enabled_extensions.size() < enabled_extensions.capacity()) {
+                add_extension(name);
+            }
+        }
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {

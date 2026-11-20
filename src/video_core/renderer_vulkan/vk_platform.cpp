@@ -21,6 +21,7 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #ifdef __APPLE__
@@ -202,6 +203,18 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     if (enable_debug_utils) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
+    // LBP3 port: a runtime add-on's instance extensions (vk_instance.h).
+    static std::vector<std::string> lbp3_extra;
+    if (g_lbp3ExtraInstanceExtensions) {
+        lbp3_extra = g_lbp3ExtraInstanceExtensions();
+        for (const std::string& name : lbp3_extra) {
+            if (std::none_of(extensions.begin(), extensions.end(),
+                             [&](const char* e) { return name == e; })) {
+                extensions.push_back(name.c_str());
+            }
+        }
     }
 
     // Sanitize extension list
