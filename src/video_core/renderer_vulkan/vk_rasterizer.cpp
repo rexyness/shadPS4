@@ -335,6 +335,8 @@ u32 g_lbp3TraceIndex = 0;
 void (*g_lbp3AfterDraw)(u32 index) = nullptr;
 void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices) = nullptr;
 void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full) = nullptr;
+bool (*g_lbp3ViewportJitter)(float width, float height, float* dx, float* dy) = nullptr;
+bool (*g_lbp3SkipDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices) = nullptr;
 
 void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
@@ -391,6 +393,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
         return;
+    }
+    // LBP3 DLSS: a draw the runtime leaves out (vk_rasterizer.h), before anything is bound.
+    if (g_lbp3SkipDraw) {
+        const auto stages = pipeline->GetStages();
+        const auto* vs = stages[u32(Shader::SwStage::Vertex)];
+        const auto* ps = stages[u32(Shader::SwStage::Fragment)];
+        if (g_lbp3SkipDraw(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0, regs.num_indices)) {
+            return;
+        }
     }
 
     PrepareRenderState(pipeline);
@@ -1677,6 +1688,14 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = yoffset - yscale;
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
+            // LBP3 DLSS: a sub-pixel offset for the 3D scene's draws (vk_rasterizer.h).
+            if (g_lbp3ViewportJitter) {
+                float dx = 0.f, dy = 0.f;
+                if (g_lbp3ViewportJitter(viewport.width, viewport.height, &dx, &dy)) {
+                    viewport.x += dx;
+                    viewport.y += dy;
+                }
+            }
         }
 
         viewports.push_back(viewport);

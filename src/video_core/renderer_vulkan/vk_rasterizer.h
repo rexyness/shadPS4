@@ -30,6 +30,12 @@ extern void (*g_lbp3AfterDraw)(u32 index);
 // masked fill the rasterizer inspects. Copies only; never set unless the capture is on.
 extern void (*g_lbp3FgAfterDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices);
 extern void (*g_lbp3FgOnFill)(u64 dst, u64 bytes, u32 value, u32 mask, bool full);
+// LBP3 DLSS (a DLSS build only; null otherwise). ViewportJitter: asked per viewport of a draw
+// with clipping on; true = add (dx, dy) pixels to the viewport origin (the 3D scene's sub-pixel
+// jitter). SkipDraw: asked per draw before anything is bound; true = leave it out (the game's
+// SMAA copy-back while DLSS anti-aliases instead).
+extern bool (*g_lbp3ViewportJitter)(float width, float height, float* dx, float* dy);
+extern bool (*g_lbp3SkipDraw)(u64 vs_hash, u64 ps_hash, u32 num_indices);
 
 class GraphicsPipeline;
 class Runtime;
