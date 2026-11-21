@@ -93,6 +93,9 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    // LBP3: the fluid simulation's results the CPU reads (issue #27; vk_rasterizer.cpp).
+    void QueueFluidResults(const Shader::Info& cs);
+    void DownloadFluidResults();
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// LBP3: a guest thread's write fault at addr was handled; unprotect the window around it
     /// too (LBP3_FAULT_WINDOW, BufferCache::ExtendWriteFault).
@@ -184,6 +187,8 @@ private:
     };
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
+    // LBP3 (issue #27): fluid results to copy for the CPU at the next fence.
+    std::vector<std::pair<VAddr, u64>> fluid_results;
     ImageBinding db_desc;
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;

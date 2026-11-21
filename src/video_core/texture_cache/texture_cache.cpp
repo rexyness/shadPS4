@@ -182,6 +182,23 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
 TextureCache::~TextureCache() = default;
 
+// LBP3: the fluid simulation's images the CPU reads (issue #27). The fire and gas jobs (spu.prx
+// Flip_Alive, Flip_Apply_Boundary_Markers, Flip_Add_Wind) read a 64x512 R8 render target (the
+// density volume reduced to one column per slice) and a 64x32x16 RGBA8 storage volume, both linear
+// and 64 wide. Without them the flames drift sideways and the gas shows no cloud. Queued here and
+// downloaded at the next submit or fence (ProcessDownloadImages), as the captures are; two a frame
+// while fire or gas is on screen. LBP3_FLUID_READBACK=0: off (with the buffers, vk_rasterizer.cpp).
+// shortcut: matched by shape (linear, 64 wide); another linear 64-wide image the game never reads
+// would be downloaded for nothing. Upgrade to readbacks of what the CPU actually reads once
+// precise readbacks work in this port.
+static bool IsFluidCpuReadImage(const ImageInfo& info) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LBP3_FLUID_READBACK");
+        return !(v && v[0] == '0');
+    }();
+    return enabled && !info.props.is_tiled && info.size.width == 64 && info.guest_address != 0;
+}
+
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
     // Without readbackLinearImages the set holds only capture-target candidates (FindRenderTarget),
@@ -189,13 +206,15 @@ void TextureCache::ProcessDownloadImages() {
     // stay on the GPU: a Bunkum cutscene draws one 1920x2160 over the pool the captures use, and
     // a synchronous download of it took 118 ms.
     const volatile u8* capture = g_lbp3CaptureQueued.load(std::memory_order_relaxed);
-    if (readback_linear_images || (capture && *capture != 0)) {
-        for (const ImageId image_id : download_images) {
-            if (True(slot_images[image_id].flags & ImageFlagBits::GpuModified)) {
-                ++g_lbp3ImageReadbacks;
-            }
-            DownloadImageMemory(image_id, true);
+    const bool all = readback_linear_images || (capture && *capture != 0);
+    for (const ImageId image_id : download_images) {
+        if (!all && !IsFluidCpuReadImage(slot_images[image_id].info)) {
+            continue;
         }
+        if (True(slot_images[image_id].flags & ImageFlagBits::GpuModified)) {
+            ++g_lbp3ImageReadbacks;
+        }
+        DownloadImageMemory(image_id, true);
     }
     download_images.clear();
 }
@@ -1054,8 +1073,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
+        if ((readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+             image.info.guest_address != 0) ||
+            IsFluidCpuReadImage(image.info)) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -1074,8 +1094,8 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 // the image is written back to guest memory, that copy reads zeros and the photo is black.
 // Such targets are queued here and downloaded (synchronously, at the submit or fence after the
 // draw) while the game has a capture job queued (ProcessDownloadImages), even without
-// LBP3_READBACK_IMAGES. The game's other linear targets (64-wide R8 ones drawn every frame, a 3D
-// storage volume) are never queued; LBP3_READBACK_IMAGES downloads every linear target.
+// LBP3_READBACK_IMAGES. The fluid's 64-wide linear images are downloaded every time
+// (IsFluidCpuReadImage); LBP3_READBACK_IMAGES downloads every linear target.
 static bool IsCpuReadRenderTarget(const ImageInfo& info) {
     return !info.props.is_tiled && !info.props.is_depth && info.num_bits == 32 &&
            info.num_samples == 1 && info.size.depth == 1 && info.resources.layers == 1 &&
@@ -1086,7 +1106,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if ((readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) ||
-        IsCpuReadRenderTarget(image.info)) {
+        IsCpuReadRenderTarget(image.info) || IsFluidCpuReadImage(image.info)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }

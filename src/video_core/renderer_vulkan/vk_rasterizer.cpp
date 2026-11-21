@@ -608,8 +608,59 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
+    QueueFluidResults(cs);
 
     ResetBindings(true);
+}
+
+// LBP3: the fire and gas effects (issue #27). Two compute shaders of the fluid simulation write
+// buffers that the game's CPU jobs read to build the effects' index buffers (the boxes the volume
+// is drawn with). On the PS4 the CPU sees the GPU's writes; here they stay in the GPU's copy, so
+// the CPU found nothing and wrote only restart indices: no flames. The buffers those dispatches
+// write are copied to guest memory at the next fence, before its label is written: the jobs read
+// the results as soon as they see the label (the simulation runs in lock-step with them, about 17
+// round trips a frame), so the copy waits for the GPU: one that doesn't wait leaves the jobs a
+// frame behind, and lands over whatever they wrote meanwhile. The two images the jobs also read
+// are copied by the texture cache (IsFluidCpuReadImage). Cost of the buffers, in the fire/gas test
+// level only: native 4K with frame generation 26.5 -> 24.1 fps, 1440 work 17.8 -> 25.0 ms (the
+// graphics queue waits longer for the jobs). LBP3_FLUID_READBACK=0: off.
+// shortcut: matched by the shaders' hashes (game version 01.28); a game update that changes them
+// turns this off silently. Upgrade to readbacks of what the CPU actually reads once precise
+// readbacks work in this port (they stall the boot today), and the cost to compute on its own
+// Vulkan queue.
+void Rasterizer::QueueFluidResults(const Shader::Info& cs) {
+    static constexpr std::array<u64, 2> kFluidShaders = {
+        0xf8ca5fa410806334ULL, // 12 a frame, four 0x21000-byte outputs
+        0xdb624fa6942b9961ULL, // 5 a frame, one 0x20000-byte output
+    };
+    static const bool enabled = [] {
+        const char* v = std::getenv("LBP3_FLUID_READBACK");
+        const bool on = !(v && v[0] == '0');
+        if (!on) {
+            std::fprintf(stderr, "[gpu] fluid readback: off (LBP3_FLUID_READBACK=0)\n");
+        }
+        return on;
+    }();
+    if (!enabled || std::find(kFluidShaders.begin(), kFluidShaders.end(), cs.pgm_hash) ==
+                        kFluidShaders.end()) {
+        return;
+    }
+    for (const auto& desc : cs.buffers) {
+        if (desc.IsSpecial() || !desc.is_written) {
+            continue;
+        }
+        const auto sharp = desc.GetSharp(cs);
+        if (sharp.base_address != 0 && sharp.GetSize() != 0) {
+            fluid_results.emplace_back(sharp.base_address, sharp.GetSize());
+        }
+    }
+}
+
+void Rasterizer::DownloadFluidResults() {
+    for (const auto& [address, size] : fluid_results) {
+        buffer_cache.ReadMemory(address, size, false, true);
+    }
+    fluid_results.clear();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -671,6 +722,7 @@ void Rasterizer::OnSubmit() {
 
 void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
+    DownloadFluidResults();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
